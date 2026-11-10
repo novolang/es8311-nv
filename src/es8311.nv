@@ -1,0 +1,726 @@
+// es8311 — Everest Semiconductor's ES8311, a low-power mono audio codec
+// with an I2C control port and an I2S/PCM serial audio port, as
+// devices-nv's `AudioCodec` and `Identifiable`.
+//
+// The facts below are from Everest's product brief "ES8311 Low Power Mono
+// Audio CODEC", Revision 7.0, January 2020 (ES8311PB), which is the public
+// document and gives the pins, the clock modes, the I2C protocol, the
+// serial formats and the electrical limits.  It does not give the register
+// map.  The register map, the clock coefficients and the power sequences
+// are from the drivers that ship with the part, read for their facts and
+// not ported: Espressif's `esp_codec_dev` driver for the ES8311 (the
+// successor of the esp-adf `es8311.c`, whose register sequences it keeps),
+// Espressif's `es8311` component in esp-bsp, and the Linux kernel's
+// `sound/soc/codecs/es8311.c`.  Where those disagree the site says which
+// was taken.  The full Everest data sheet could not be fetched, so the
+// register map below is not checked against it.
+//
+// The registers, as this driver uses them:
+//
+//   0x00 RESET       CSM_ON (7), MSC master (6), RST (4:0), 0x1F resets
+//   0x01 CLKMGR1     MCLK_SEL (7, 1 takes SCLK as the master clock),
+//                    MCLK invert (6), MCLK_ON (5), BCLK_ON (4), CLKADC (3),
+//                    CLKDAC (2), ANACLKADC (1), ANACLKDAC (0)
+//   0x02 CLKMGR2     DIV_PRE - 1 (7:5), MULT_PRE code (4:3)
+//   0x03 CLKMGR3     FS_MODE (6), ADC OSR (5:0)
+//   0x04 CLKMGR4     DAC OSR (6:0)
+//   0x05 CLKMGR5     ADC divider - 1 (7:4), DAC divider - 1 (3:0)
+//   0x06 CLKMGR6     BCLK invert (5), BCLK divider code (4:0)
+//   0x07 CLKMGR7     LRCK divider - 1, high four bits (3:0)
+//   0x08 CLKMGR8     LRCK divider - 1, low byte
+//   0x09 SDP_IN      DAC source slot (7), mute (6), LRP (5), word length
+//                    (4:2), format (1:0)
+//   0x0A SDP_OUT     mute (6), LRP (5), word length (4:2), format (1:0)
+//   0x0D SYS3        analogue power; 0xFA is powered down, 0x01 is up
+//   0x0E SYS4        PGA and ADC modulator power
+//   0x12 SYS8        DAC power
+//   0x13 SYS9        headphone output enable (4)
+//   0x14 SYS10       digital microphone (6), line select (4), PGA gain (3:0)
+//   0x15 ADC1        ADC ramp rate (7:4)
+//   0x16 ADC2        input scale (2:0)
+//   0x17 ADC3        ADC digital volume
+//   0x1C ADC8        equaliser bypass (6), high-pass filter (5)
+//   0x31 DAC1        DAC soft mute (6) and mute (5)
+//   0x32 DAC2        DAC digital volume
+//   0x37 DAC6        ramp rate (7:4), equaliser bypass (3)
+//   0x44 GPIO        ADC to DAC test path (7), ADCDAT select (6:4), and the
+//                    I2C noise immunity bit (3)
+//   0xFD 0xFE 0xFF   chip ID 0x83, chip ID 0x11, version
+//
+// The clock.  The codec makes everything from a digital master clock of
+// 256 x fs: the LRCK divider is 256 (CLKMGR7/8 hold 0x00FF) and the ADC and
+// DAC dividers are 1.  The clock the board gives, MCLK or, with MCLK_SEL
+// set, SCLK, is brought to 256 x fs by a divider of 1 to 8 and a multiplier
+// of 1, 2, 4 or 8.  `clock_plan` finds them: for 12.288 MHz at 8 kHz it is
+// divide by 6, for 12.288 MHz at 32 kHz divide by 3 and multiply by 2.
+// A clock that no divider and multiplier turn into 256 x fs, a 12 MHz USB
+// clock, or an 18.432 MHz clock at 8 and 16 kHz, whose rows in the
+// reference tables use a different LRCK divider, is refused.
+//
+// Disagreements between the reference drivers, and what was taken:
+//   * The DAC oversampling register.  esp_codec_dev writes 0x20 for rates
+//     up to 16 kHz and 0x10 above; the esp-bsp component and the Linux
+//     driver leave 0x10 throughout.  This driver follows esp_codec_dev,
+//     the ADC register is 0x10 in all of them.
+//   * The BCLK divider code.  Up to a divider of 18 the code is the
+//     divider less one in all three.  Above that esp_codec_dev writes the
+//     divider itself (below 19, otherwise the divider as a code) and Linux
+//     indexes a table of 22, 24, 25, 30, 32, 33, 34, 36, 44, 48, 66 and 72
+//     from 20.  They give different codes for 19 and 20, so the driver
+//     refuses a divider above 18.
+//   * The word-length bits.  esp_codec_dev ORs the bits for 16 bits and
+//     clears the field for 24 only, leaving a stale bit 4 when a port goes
+//     from 32 bits to 16; `serial_port` writes the whole field.
+//   * Power-up.  esp-bsp unmutes the DAC when it starts; here the DAC
+//     is muted before it is powered, and stays muted until `codec_set_mute`
+//     opens it, as `AudioCodec` requires.
+//   * The first write after the reset.  esp_codec_dev writes the GPIO
+//     register's noise-immunity bit twice "due to occasional failures
+//     during the first I2C write"; `reg44_write` retries it once.
+
+use embedded_hal.{ BoardI2c, BoardTimer, I2cBus, Timer, I2s, I2sConfig, I2sRole, I2sFormat }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
+use dev_id.{ DeviceId, Identifiable }
+
+// The registers.
+let RESET     = 0x00
+let CLKMGR1   = 0x01
+let CLKMGR2   = 0x02
+let CLKMGR3   = 0x03
+let CLKMGR4   = 0x04
+let CLKMGR5   = 0x05
+let CLKMGR6   = 0x06
+let CLKMGR7   = 0x07
+let CLKMGR8   = 0x08
+let SDP_IN    = 0x09
+let SDP_OUT   = 0x0A
+let SYS1      = 0x0B
+let SYS2      = 0x0C
+let SYS3      = 0x0D
+let SYS4      = 0x0E
+let SYS6      = 0x10
+let SYS7      = 0x11
+let SYS8      = 0x12
+let SYS9      = 0x13
+let SYS10     = 0x14
+let ADC1      = 0x15
+let ADC2      = 0x16
+let ADC3      = 0x17
+let ADC7      = 0x1B
+let ADC8      = 0x1C
+let DAC1      = 0x31
+let DAC2      = 0x32
+let DAC6      = 0x37
+let GPIO_REG  = 0x44
+let GP_REG    = 0x45
+let CHIP_ID1  = 0xFD
+let CHIP_ID2  = 0xFE
+let CHIP_VER  = 0xFF
+
+// The chip ID bytes.
+let ID1_VALUE = 0x83
+let ID2_VALUE = 0x11
+
+// RESET: the state machine on, master mode, and the reset field.
+let RESET_CSM_ON = 0x80
+let RESET_MASTER = 0x40
+let RESET_ALL    = 0x1F
+
+// CLKMGR1: the clocks on, the clock source and its inversion.
+let CLK_MCLK_SEL  = 0x80
+let CLK_MCLK_INV  = 0x40
+let CLK_BASE      = 0x30
+let CLK_CONVERTER = 0x0F
+
+// SDP_IN and SDP_OUT: the mute bit, LRP, and the fields.
+let SDP_MUTE   = 0x40
+let SDP_LRP    = 0x20
+let SDP_DAC_R  = 0x80
+
+// DAC1: both mute bits.
+let DAC_MUTE_BITS = 0x60
+
+// The analogue power words.
+let SYS3_DOWN    = 0xFA
+let SYS3_SUSPEND = 0xFC
+let SYS3_UP      = 0x01
+
+// The I2C clock `setup` asks for.
+let I2C_HZ = 400000
+
+// The time the reset is held, in milliseconds (esp-bsp: 20).
+let RESET_HOLD_MS = 20
+
+// The ranges of the gains, in thousandths of a decibel.  The DAC and ADC
+// digital volumes run from -95.5 dB at code 0 to +32 dB at code 255 in
+// 0.5 dB steps (esp_codec_dev's range, Linux's TLV).  The input PGA is
+// 0 to 30 dB in 3 dB steps, the ADC scale 0 to 42 dB in 6 dB steps.
+let VOL_MIN_MDB  = -95500
+let VOL_MAX_MDB  = 32000
+let VOL_STEP_MDB = 500
+let PGA_STEP_MDB   = 3000
+let PGA_MAX_CODE   = 10
+let SCALE_STEP_MDB = 6000
+let SCALE_MAX_CODE = 7
+
+// The sample rates of the product brief: 8 to 96 kHz.
+let RATE_MIN = 8000
+let RATE_MAX = 96000
+
+// What a program says about how the codec is clocked and wired.
+//
+// `mclk_ratio` is the master clock the board gives, as a multiple of the
+// sample rate (256 is the usual MCLK), or 0 when the board gives no master
+// clock and the codec takes its bit clock as the clock.  `invert_mclk` and
+// `invert_sclk` invert the clocks, for a board whose wiring needs it.
+// `digital_mic` takes a PDM microphone on the MIC1P pin in place of the
+// analogue input.
+pub @value
+struct Es8311Config
+    mclk_ratio: Int
+    invert_mclk: Bool
+    invert_sclk: Bool
+    digital_mic: Bool
+
+// The usual wiring: a master clock of 256 x fs, no inversion, an analogue
+// microphone.
+pub fn config_default() -> Es8311Config
+    Es8311Config { mclk_ratio: 256, invert_mclk: false, invert_sclk: false, digital_mic: false }
+
+// The same with no master clock: the codec takes its bit clock as its
+// clock.
+pub fn config_sclk() -> Es8311Config
+    Es8311Config { mclk_ratio: 0, invert_mclk: false, invert_sclk: false, digital_mic: false }
+
+// The control port: the I2C bus the codec is on.  `setup` makes the bus
+// ready and answers whether the wiring suits it, `read_regs` reads `n`
+// registers from `reg`, `write_reg` writes one, and `pause_ms` waits.
+pub trait Es8311Port
+    fn setup(self) -> Bool [hw]
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+    fn pause_ms(self, ms: Int) [hw]
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+// Reads `n` registers from `reg` into `dst` in one I2C transaction, a
+// write of the register and a repeated start: whether the part answered.
+pub fn i2c_read_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                                var dst: DevBytes) -> Bool [hw]
+    dev_bus.wiring_read_into(bus, w, reg, n, var dst)
+
+// Writes `v` to the register `reg` in one I2C transaction: whether the
+// part acknowledged.
+pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push((v & 0xFF) as u8)
+    dev_bus.wiring_write_from(bus, w, reg, src)
+
+// Makes the bus ready at 400 kHz and answers whether the wiring has an
+// address.
+pub fn i2c_setup<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    bus.init(I2C_HZ)
+    w.addr != None
+
+// ── Registers ────────────────────────────────────────────────────────
+
+// One register, or `None` when the part did not answer.
+pub fn reg_read<P: Es8311Port>(p: P, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(reg, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// Writes `v` to the register `reg`: whether the part acknowledged.  The
+// registers are not read back: RESET and the mute bits change what they
+// hold.
+pub fn reg_write<P: Es8311Port>(p: P, reg: Int, v: Int) -> Bool [hw]
+    p.write_reg(reg, v & 0xFF)
+
+// Sets the bits of `mask` in `reg` to the bits of `bits`, leaving the
+// others, read from the part: whether the part took it.
+pub fn reg_update<P: Es8311Port>(p: P, reg: Int, mask: Int, flags: Int) -> Bool [hw]
+    let Some(old) = reg_read(p, reg) else return false
+    reg_write(p, reg, (old & (0xFF ^ mask)) | (flags & mask))
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+// The chip ID as a `DeviceId`: `who` is the two ID bytes, 0x8311, and
+// `rev` the version register.  `None` when no part answers or the ID is
+// not an ES8311's.
+pub fn id_read<P: Es8311Port>(p: P) -> ?DeviceId [hw]
+    let Some(a) = reg_read(p, CHIP_ID1) else return None
+    let Some(b) = reg_read(p, CHIP_ID2) else return None
+    if a != ID1_VALUE or b != ID2_VALUE
+        return None
+    let ver = reg_read(p, CHIP_VER)
+    Some(DeviceId { who: (a << 8) | b, rev: ver })
+
+// ── The clock ────────────────────────────────────────────────────────
+
+// How the clock is brought to 256 x fs and the serial clock made.
+// `pre_div` is the divider of 1 to 8, `mult` the multiplier 1, 2, 4 or 8
+// and `mult_code` its register code, `bclk_div` the divider from the digital
+// clock to the bit clock (0 when the bit clock is not a whole division of
+// it), and `adc_osr` and `dac_osr` the oversampling registers.
+pub @value
+struct ClockPlan
+    pre_div: Int
+    mult: Int
+    mult_code: Int
+    bclk_div: Int
+    adc_osr: Int
+    dac_osr: Int
+
+// The code of a multiplier of 1, 2, 4 or 8.
+fn mult_code_of(m: Int) -> Int
+    if m == 1
+        return 0
+    if m == 2
+        return 1
+    if m == 4
+        return 2
+    3
+
+// The BCLK divider register's code for a divider of 1 to 18, or -1.
+pub fn bclk_code(div: Int) -> Int
+    if div < 1 or div > 18
+        return -1
+    div - 1
+
+// The plan for a master clock of `mclk_hz` at the sample rate `rate`, with
+// the bit clock `bclk_hz` the I2S block gives or takes: `None` for a rate
+// outside 8 to 96 kHz and for a clock that no divider of 1 to 8 and
+// multiplier of 1, 2, 4 or 8 turns into 256 x rate.  The smallest
+// multiplier is taken, then the smallest divider.
+pub fn clock_plan(mclk_hz: Int, rate: Int, bclk_hz: Int) -> ?ClockPlan
+    if rate < RATE_MIN or rate > RATE_MAX or mclk_hz <= 0 or bclk_hz <= 0
+        return None
+    let dig = rate * 256
+    var osr = 0x10
+    if rate <= 16000
+        osr = 0x20
+    var bdiv = 0
+    if dig % bclk_hz == 0
+        bdiv = dig / bclk_hz
+    for mi in 0..4
+        let m = 1 << mi
+        for d in 1..9
+            if mclk_hz * m == dig * d
+                return Some(ClockPlan { pre_div: d, mult: m, mult_code: mult_code_of(m),
+                                        bclk_div: bdiv, adc_osr: 0x10, dac_osr: osr })
+    None
+
+// The master clock the board gives for a configuration at `rate`: the
+// ratio times the rate, or, with no master clock, the bit clock.
+pub fn mclk_of(c: Es8311Config, rate: Int, bclk_hz: Int) -> Int
+    if c.mclk_ratio == 0
+        return bclk_hz
+    c.mclk_ratio * rate
+
+// ── The serial port ──────────────────────────────────────────────────
+
+// The word-length code of a bit depth: 16, 24 or 32 bits, or -1.
+pub fn wl_code(depth: Int) -> Int
+    if depth == 16
+        return 3
+    if depth == 24
+        return 0
+    if depth == 32
+        return 4
+    -1
+
+// The format code of a framing: 0 for I2S, 1 for left-justified.
+pub fn fmt_code(f: AudioFraming) -> Int
+    match f
+        AudioFraming.AudioPhilips       => 0
+        AudioFraming.AudioLeftJustified => 1
+
+// ── The named steps ──────────────────────────────────────────────────
+//
+// The sequences, one step per function, so that the order is the one place
+// to read and to test.
+
+// The first write after the reset is retried once; esp_codec_dev notes the
+// part sometimes drops it.
+fn reg44_write<P: Es8311Port>(p: P, v: Int) -> Bool [hw]
+    reg_write(p, GPIO_REG, v) or reg_write(p, GPIO_REG, v)
+
+// Step: the reset.  RESET 0x1F holds the state machine and the blocks in
+// reset, the part waits 20 ms, RESET 0 releases them and 0x80 turns the
+// state machine on.
+pub fn step_reset<P: Es8311Port>(p: P) -> Bool [hw]
+    if not reg_write(p, RESET, RESET_ALL)
+        return false
+    p.pause_ms(RESET_HOLD_MS)
+    reg_write(p, RESET, 0) and reg_write(p, RESET, RESET_CSM_ON)
+
+// Step: the base state after the reset, from esp_codec_dev's `open`:
+// analogue power down, noise immunity on, the master clock and bit clock
+// on, the dividers at their reset values, the system registers at their
+// minimum power, the headphone driver enabled, the ADC filters set and the
+// ADC to DAC test path off.
+pub fn step_open<P: Es8311Port>(p: P, c: Es8311Config) -> Bool [hw]
+    let Some(s3) = reg_read(p, SYS3) else return false
+    if s3 != SYS3_DOWN and not reg_write(p, SYS3, SYS3_DOWN)
+        return false
+    if not reg44_write(p, 0x08)
+        return false
+    reg_write(p, CLKMGR1, clock_source_bits(c) | CLK_BASE) and reg_write(p, CLKMGR2, 0x00) and reg_write(p, CLKMGR3, 0x10) and reg_write(p, ADC2, 0x24) and reg_write(p, CLKMGR4, 0x10) and reg_write(p, CLKMGR5, 0x00) and reg_write(p, SYS1, 0x00) and reg_write(p, SYS2, 0x00) and reg_write(p, SYS6, 0x1F) and reg_write(p, SYS7, 0x7F) and reg_write(p, SYS9, 0x10) and reg_write(p, ADC7, 0x0A) and reg_write(p, ADC8, 0x6A) and reg_write(p, GPIO_REG, 0x08)
+
+// CLKMGR1's source and inversion bits for a configuration.
+pub fn clock_source_bits(c: Es8311Config) -> Int
+    var v = 0
+    if c.mclk_ratio == 0
+        v = v | CLK_MCLK_SEL
+    if c.invert_mclk
+        v = v | CLK_MCLK_INV
+    v
+
+// Step: the clock registers for a plan: the dividers and multiplier, the
+// oversampling, the ADC and DAC dividers, the bit clock (with its
+// inversion) and the LRCK divider of 256.
+pub fn step_clocks<P: Es8311Port>(p: P, c: Es8311Config, plan: ClockPlan, bclk: Int) -> Bool [hw]
+    var sclk = 0
+    if c.invert_sclk
+        sclk = 0x20
+    reg_update(p, CLKMGR2, 0xF8, ((plan.pre_div - 1) << 5) | (plan.mult_code << 3)) and reg_update(p, CLKMGR3, 0x7F, plan.adc_osr) and reg_update(p, CLKMGR4, 0x7F, plan.dac_osr) and reg_write(p, CLKMGR5, 0x00) and reg_update(p, CLKMGR6, 0x3F, sclk | bclk) and reg_update(p, CLKMGR7, 0x0F, 0x00) and reg_write(p, CLKMGR8, 0xFF)
+
+// Step: the serial port, both directions: the word length, the format and
+// LRP, leaving the mute bits and the DAC's slot select.  `lrp` is set for
+// DSP mode B.
+pub fn step_serial_port<P: Es8311Port>(p: P, wl: Int, fmt: Int, lrp: Bool) -> Bool [hw]
+    var flags = (wl << 2) | fmt
+    if lrp
+        flags = flags | SDP_LRP
+    reg_update(p, SDP_IN, 0x3F, flags) and reg_update(p, SDP_OUT, 0x3F, flags)
+
+// Step: the clock source and the role: RESET's master bit, then CLKMGR1
+// with the source and inversion and the master and bit clocks on.
+pub fn step_source<P: Es8311Port>(p: P, c: Es8311Config, master: Bool) -> Bool [hw]
+    var v = RESET_CSM_ON
+    if master
+        v = v | RESET_MASTER
+    reg_write(p, RESET, v) and reg_write(p, CLKMGR1, clock_source_bits(c) | CLK_BASE)
+
+// Step: power up.  The state machine on in the role the part has, the ADC
+// and DAC clocks on, the serial ports unmuted, the DAC muted before it is
+// powered, the ADC volume at 0 dB, the PGA and modulator on, the DAC on, the
+// microphone input chosen at maximum PGA gain, the analogue power up, and
+// the ramp and equaliser registers.
+pub fn step_power_up<P: Es8311Port>(p: P, c: Es8311Config) -> Bool [hw]
+    var mic = 0x1A
+    if c.digital_mic
+        mic = mic | 0x40
+    reg_update(p, RESET, RESET_CSM_ON, RESET_CSM_ON) and reg_update(p, CLKMGR1, CLK_CONVERTER, CLK_CONVERTER) and reg_update(p, SDP_IN, SDP_MUTE, 0) and reg_update(p, SDP_OUT, SDP_MUTE, 0) and reg_write(p, DAC1, DAC_MUTE_BITS) and reg_write(p, ADC3, 0xBF) and reg_write(p, SYS4, 0x02) and reg_write(p, SYS8, 0x00) and reg_write(p, SYS10, mic) and reg_write(p, SYS3, SYS3_UP) and reg_write(p, ADC1, 0x40) and reg_write(p, DAC6, 0x08) and reg_write(p, GP_REG, 0x00)
+
+// Step: power down, from esp_codec_dev's suspend.  The DAC is muted first,
+// then the volumes go to their lowest, the PGA, modulator and DAC are
+// powered down, the analogue power goes to its suspend word, the state
+// machine is held in reset and the clocks are stopped.  The clock
+// registers are lost, so a power-up needs `codec_set_format` again.
+pub fn step_power_down<P: Es8311Port>(p: P) -> Bool [hw]
+    reg_write(p, DAC1, DAC_MUTE_BITS) and reg_write(p, DAC2, 0x00) and reg_write(p, ADC3, 0x00) and reg_write(p, SYS4, 0xFF) and reg_write(p, SYS8, 0x02) and reg_write(p, SYS10, 0x00) and reg_write(p, SYS3, SYS3_DOWN) and reg_write(p, ADC1, 0x00) and reg_write(p, CLKMGR2, 0x10) and reg_write(p, RESET, 0x00) and reg_write(p, RESET, RESET_ALL) and reg_write(p, CLKMGR1, 0x30) and reg_write(p, CLKMGR1, 0x00) and reg_write(p, GP_REG, 0x00) and reg_write(p, SYS3, SYS3_SUSPEND) and reg_write(p, CLKMGR2, 0x00)
+
+// Brings the part up: the bus ready, the chip ID read, the reset and the
+// base state.  Answers whether the part answered as an ES8311 and took every
+// write.
+pub fn start<P: Es8311Port>(p: P, c: Es8311Config) -> Bool [hw]
+    if not p.setup()
+        return false
+    if id_read(p) == None
+        return false
+    step_reset(p) and step_open(p, c)
+
+// ── Format, power, mute and gain ─────────────────────────────────────
+
+// The I2S settings for a format: the board drives the clocks unless the
+// codec does.
+pub fn i2s_config_of(f: AudioFormat) -> I2sConfig
+    var role = I2sRole.I2sMaster
+    if f.codec_is_master
+        role = I2sRole.I2sSlave
+    var layout = I2sFormat.I2sPhilips
+    if f.framing == AudioFraming.AudioLeftJustified
+        layout = I2sFormat.I2sLeftJustified
+    I2sConfig { sample_rate: f.sample_rate, bit_depth: f.bit_depth, channels: f.channels,
+                role: role, format: layout }
+
+// The plan for a format, or `None` when the codec cannot make it: a depth
+// other than 16, 24 or 32, a rate or clock `clock_plan` refuses, or, with
+// the codec as master, a bit clock that is not a whole division of the
+// digital clock.
+pub fn plan_of(c: Es8311Config, f: AudioFormat) -> ?ClockPlan
+    if not dev_audio.audio_format_valid(f) or wl_code(f.bit_depth) < 0
+        return None
+    let bclk = embedded_hal.i2s_bclk_hz(i2s_config_of(f))
+    let found = clock_plan(mclk_of(c, f.sample_rate, bclk), f.sample_rate, bclk)
+    let Some(plan) = found else return None
+    if f.codec_is_master and bclk_code(plan.bclk_div) < 0
+        return None
+    Some(plan)
+
+// Programs the codec for a format and configures and enables the board's
+// I2S handle for it: the plan found, the handle configured and enabled (the
+// part needs its clocks to run before its registers are final), then the
+// clock source and role, the dividers and the serial port.  A slave codec
+// has no use for the bit-clock divider and keeps a divider of 4.
+pub fn format_set<P: Es8311Port, S: I2s>(p: P, i2s: S, c: Es8311Config, f: AudioFormat) -> Bool [hw]
+    let Some(plan) = plan_of(c, f) else return false
+    if not i2s.configure(i2s_config_of(f))
+        return false
+    if not i2s.enable()
+        return false
+    var bclk = 3
+    if f.codec_is_master
+        bclk = bclk_code(plan.bclk_div)
+    step_source(p, c, f.codec_is_master) and step_clocks(p, c, plan, bclk) and step_serial_port(p, wl_code(f.bit_depth), fmt_code(f.framing), false)
+
+// Powers the converters up or down.  Up is `step_power_up`: the DAC is
+// muted and stays muted until `codec_set_mute(false)`.  Down is
+// `step_power_down`, and the board's I2S handle is disabled after it.
+pub fn power_set<P: Es8311Port, S: I2s>(p: P, i2s: S, c: Es8311Config, on: Bool) -> Bool [hw]
+    if on
+        return step_power_up(p, c)
+    let ok = step_power_down(p)
+    i2s.disable()
+    ok
+
+// Mutes or unmutes the DAC: DAC1's soft mute and mute bits together.
+pub fn mute_set<P: Es8311Port>(p: P, on: Bool) -> Bool [hw]
+    var flags = 0
+    if on
+        flags = DAC_MUTE_BITS
+    reg_update(p, DAC1, DAC_MUTE_BITS, flags)
+
+// Whether the DAC is muted: both bits set; `None` when the part did not
+// answer.
+pub fn mute_get<P: Es8311Port>(p: P) -> ?Bool [hw]
+    let Some(v) = reg_read(p, DAC1) else return None
+    Some((v & DAC_MUTE_BITS) == DAC_MUTE_BITS)
+
+// The DAC volume register for a gain in thousandths of a decibel, or
+// `None` below the range.
+pub fn volume_code(g: MilliDb) -> ?Int
+    match dev_audio.audio_gain_step(g, VOL_MIN_MDB, VOL_MAX_MDB, VOL_STEP_MDB)
+        Some(s) => Some((s.mdb - VOL_MIN_MDB) / VOL_STEP_MDB)
+        None    => None
+
+// The gain of a volume register, in thousandths of a decibel.
+pub fn volume_mdb(code: Int) -> Int
+    VOL_MIN_MDB + code * VOL_STEP_MDB
+
+// The split of an input gain into PGA and scale codes: the PGA first, up
+// to 30 dB in 3 dB steps, then the scale in 6 dB steps.  The sum of the two
+// is the largest step of the part at or below `g`.
+pub @value
+struct InputGain
+    pga: Int
+    scale: Int
+
+// The split for a gain of `g` thousandths of a decibel, 0 or more.
+pub fn input_split(g: Int) -> InputGain
+    var pga = g / PGA_STEP_MDB
+    if pga > PGA_MAX_CODE
+        pga = PGA_MAX_CODE
+    var scale = (g - pga * PGA_STEP_MDB) / SCALE_STEP_MDB
+    if scale > SCALE_MAX_CODE
+        scale = SCALE_MAX_CODE
+    InputGain { pga: pga, scale: scale }
+
+// The gain of a split, in thousandths of a decibel.
+pub fn input_mdb(s: InputGain) -> Int
+    s.pga * PGA_STEP_MDB + s.scale * SCALE_STEP_MDB
+
+// Sets the DAC volume or the input gain to the largest step at or below
+// `g`: the gain set, or `None` when `g` is below the path's range or the
+// part did not take it.  Code 0 of the DAC is -95.5 dB, not silence; the
+// output is silenced by `mute_set`.
+pub fn gain_set<P: Es8311Port>(p: P, path: CodecPath, g: MilliDb) -> ?MilliDb [hw]
+    // workaround(a-match-over-an-enum-whose-arms-answer-an-optional-struct-is-emitted-with-a-pointer-slot): a match over an enum whose arms answer ?MilliDb fails IR verification, so the path is compared.
+    if path == CodecPath.CodecOutput
+        return output_gain_set(p, g)
+    input_gain_set(p, g)
+
+fn output_gain_set<P: Es8311Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
+    let Some(code) = volume_code(g) else return None
+    if not reg_write(p, DAC2, code)
+        return None
+    Some(MilliDb { mdb: volume_mdb(code) })
+
+fn input_gain_set<P: Es8311Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
+    if g.mdb < 0
+        return None
+    let s = input_split(g.mdb)
+    if not reg_update(p, SYS10, 0x0F, s.pga)
+        return None
+    if not reg_update(p, ADC2, 0x07, s.scale)
+        return None
+    Some(MilliDb { mdb: input_mdb(s) })
+
+// The gain of a path as the part holds it, or `None` when it did not
+// answer.  An input PGA code above 10 is read as 10.
+pub fn gain_get<P: Es8311Port>(p: P, path: CodecPath) -> ?MilliDb [hw]
+    // workaround(a-match-over-an-enum-whose-arms-answer-an-optional-struct-is-emitted-with-a-pointer-slot): the same enum match over ?MilliDb arms, spelled as a comparison.
+    if path == CodecPath.CodecOutput
+        return output_gain_get(p)
+    input_gain_get(p)
+
+fn output_gain_get<P: Es8311Port>(p: P) -> ?MilliDb [hw]
+    let Some(v) = reg_read(p, DAC2) else return None
+    Some(MilliDb { mdb: volume_mdb(v) })
+
+fn input_gain_get<P: Es8311Port>(p: P) -> ?MilliDb [hw]
+    let Some(a) = reg_read(p, SYS10) else return None
+    let Some(b) = reg_read(p, ADC2) else return None
+    var pga = a & 0x0F
+    if pga > PGA_MAX_CODE
+        pga = PGA_MAX_CODE
+    Some(MilliDb { mdb: input_mdb(InputGain { pga: pga, scale: b & 0x07 }) })
+
+// ── Settings the traits have no place for ────────────────────────────
+
+// The ADC digital volume: the largest step at or below `g`, -95.5 dB to
+// +32 dB in 0.5 dB steps, on top of the input gain.  The gain set, or
+// `None`.
+pub fn adc_volume_set<P: Es8311Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
+    let Some(code) = volume_code(g) else return None
+    if not reg_write(p, ADC3, code)
+        return None
+    Some(MilliDb { mdb: volume_mdb(code) })
+
+// The ADC digital volume as the part holds it.
+pub fn adc_volume_get<P: Es8311Port>(p: P) -> ?MilliDb [hw]
+    let Some(v) = reg_read(p, ADC3) else return None
+    Some(MilliDb { mdb: volume_mdb(v) })
+
+// Selects a digital microphone on MIC1P (`true`) or the analogue input,
+// leaving the PGA gain.
+pub fn dmic_set<P: Es8311Port>(p: P, on: Bool) -> Bool [hw]
+    var flags = 0
+    if on
+        flags = 0x40
+    reg_update(p, SYS10, 0x40, flags)
+
+// Enables the headphone driver (`true`) or leaves the line output.
+pub fn headphone_set<P: Es8311Port>(p: P, on: Bool) -> Bool [hw]
+    var flags = 0
+    if on
+        flags = 0x10
+    reg_update(p, SYS9, 0x10, flags)
+
+// Puts both serial ports in DSP/PCM mode, A (`b` false) or B (`b` true,
+// LRP set), at the word length of `depth`; the handle is the caller's to
+// configure for it.  False for a depth the part has not.
+pub fn dsp_format_set<P: Es8311Port>(p: P, depth: Int, b: Bool) -> Bool [hw]
+    let wl = wl_code(depth)
+    if wl < 0
+        return false
+    step_serial_port(p, wl, 3, b)
+
+// Chooses the slot of the stereo frame the DAC plays: the right (`true`)
+// or the left.
+pub fn dac_slot_set<P: Es8311Port>(p: P, right: Bool) -> Bool [hw]
+    var flags = 0
+    if right
+        flags = SDP_DAC_R
+    reg_update(p, SDP_IN, SDP_DAC_R, flags)
+
+// ── The codec on a board's I2C bus and I2S handle ────────────────────
+
+// An ES8311 on a board's I2C bus at the address `w.addr`, 0x18 or 0x19
+// by the CE pin, and the board's I2S handle that carries its samples.
+pub struct Es8311<S: I2s>
+    bus: BoardI2c
+    w: DeviceWiring
+    i2s: S
+    cfg: Es8311Config
+
+// The codec at `w.addr` on the board's I2C bus, with the I2S handle `i2s`
+// for its samples.  Nothing is sent.  A struct with a generic field cannot
+// be a `@value`, so the codec is one cell of the arena, built in a `system`
+// block, the one allocation of the package.
+pub fn attach<S: I2s>(bus: BoardI2c, w: DeviceWiring, i2s: S, cfg: Es8311Config) -> Es8311<S>
+    system
+        return Es8311 { bus: bus, w: w, i2s: i2s, cfg: cfg }
+
+impl Es8311Port for Es8311
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        i2c_write(self.bus, self.w, reg, v)
+
+    fn pause_ms(self, ms: Int) [hw]
+        BoardTimer { id: 0 }.delay_ms(ms)
+
+impl Es8311
+    // Brings the part up (`start`): the chip ID, the reset and the base
+    // state.  The caller has powered the part and waited for its supply.
+    fn begin(self) -> Bool [hw]
+        start(self, self.cfg)
+
+    // One register's byte, `None` when the part did not answer.
+    fn reg(self, r: Int) -> ?Int [hw]
+        reg_read(self, r)
+
+    // Writes a register.
+    fn set_reg(self, r: Int, v: Int) -> Bool [hw]
+        reg_write(self, r, v)
+
+    // The ADC digital volume (`adc_volume_set`).
+    fn set_adc_volume(self, g: MilliDb) -> ?MilliDb [hw]
+        adc_volume_set(self, g)
+
+    // The ADC digital volume as the part holds it.
+    fn adc_volume(self) -> ?MilliDb [hw]
+        adc_volume_get(self)
+
+    // Selects the digital microphone input (`dmic_set`).
+    fn set_dmic(self, on: Bool) -> Bool [hw]
+        dmic_set(self, on)
+
+    // Enables the headphone driver (`headphone_set`).
+    fn set_headphone(self, on: Bool) -> Bool [hw]
+        headphone_set(self, on)
+
+    // DSP mode on both ports (`dsp_format_set`).
+    fn set_dsp_format(self, depth: Int, b: Bool) -> Bool [hw]
+        dsp_format_set(self, depth, b)
+
+    // The slot the DAC plays (`dac_slot_set`).
+    fn set_dac_slot(self, right: Bool) -> Bool [hw]
+        dac_slot_set(self, right)
+
+    // Stops the I2S handle's clocks without powering the codec down.
+    fn i2s_stop(self) [hw]
+        self.i2s.disable()
+
+impl AudioCodec[hw] for Es8311
+    fn codec_set_format(self, f: AudioFormat) -> Bool [hw]
+        format_set(self, self.i2s, self.cfg, f)
+
+    fn codec_set_power(self, on: Bool) -> Bool [hw]
+        power_set(self, self.i2s, self.cfg, on)
+
+    fn codec_set_mute(self, on: Bool) -> Bool [hw]
+        mute_set(self, on)
+
+    fn codec_is_muted(self) -> ?Bool [hw]
+        mute_get(self)
+
+    fn codec_set_gain(self, path: CodecPath, g: MilliDb) -> ?MilliDb [hw]
+        gain_set(self, path, g)
+
+    fn codec_gain(self, path: CodecPath) -> ?MilliDb [hw]
+        gain_get(self, path)
+
+impl Identifiable[hw] for Es8311
+    // The two ID bytes as `who`, 0x8311, and the version register as
+    // `rev`.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self)

@@ -1,0 +1,956 @@
+// es8311_tests — the driver over a double of the part: a register file on
+// an I2C bus, and a double of the board's I2S handle.  The log keeps every
+// transaction in a form the tests compare, so the order of the steps, which
+// the data of the reference drivers fixes, is pinned register by register.
+//
+// Log entries: a write of `v` to register `r` is `65536 + r * 256 + v`; a
+// read of one register is `131072 + r * 256 + 1`; a pause of `ms`
+// milliseconds is `196608 + ms`.  The helpers `lw`, `lr` and `lp` build
+// them.
+//
+// The chip's state, in `st`: 0 is 1 when a part is there, 1 the writes seen,
+// 2 the write number from which every write is refused (0 for none), 3
+// armed to refuse the next write to register 0x44, 4 the I2C clock set, 5 a
+// register whose read is refused (0 for none), 6 the pauses seen, 9 the
+// entries in the log.
+//
+// The I2S double's state, in `ist`: 0 configure calls, 1 sample rate, 2 bit
+// depth, 3 channels, 4 role (0 master, 1 slave), 5 format (0 Philips, 1
+// left-justified), 6 enabled, 8 refuse configure, 10 disable calls, 13
+// refuse enable.
+
+use std.test
+use embedded_hal.{ BoardI2c, I2cBus, I2s, I2sConfig, I2sRole, I2sFormat }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
+use dev_id.{ DeviceId, Identifiable }
+use es8311
+use es8311.{ Es8311Port, Es8311Config, ClockPlan, InputGain }
+
+// ── The doubles ──────────────────────────────────────────────────────
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// A part with the chip ID and version in place.
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), log: HashMap.new() }
+    c.regs.insert(0xFD, 0x83)
+    c.regs.insert(0xFE, 0x11)
+    c.regs.insert(0xFF, 0x0A)
+    c.st.insert(0, 1)
+    c
+
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 9)
+    c.log.insert(n, v)
+    c.st.insert(9, n + 1)
+
+fn log_clear(c: Chip)
+    c.st.insert(9, 0)
+
+fn lw(r: Int, v: Int) -> Int
+    65536 + r * 256 + v
+
+fn lr(r: Int) -> Int
+    131072 + r * 256 + 1
+
+fn lp(ms: Int) -> Int
+    196608 + ms
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 9), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+fn reg_of(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(4, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if data.len() != 2
+            return false
+        let reg = data[0] as Int
+        let v = data[1] as Int
+        log_push(self.c, lw(reg, v))
+        let n = at(self.c.st, 1) + 1
+        self.c.st.insert(1, n)
+        if addr != 0x18 or at(self.c.st, 0) == 0
+            return false
+        let from = at(self.c.st, 2)
+        if from > 0 and n >= from
+            return false
+        if reg == 0x44 and at(self.c.st, 3) == 1
+            self.c.st.insert(3, 0)
+            return false
+        self.c.regs.insert(reg, v)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        let reg = tx[0] as Int
+        log_push(self.c, 131072 + reg * 256 + n)
+        if addr != 0x18 or at(self.c.st, 0) == 0
+            return None
+        if reg + 1 == at(self.c.st, 5)
+            return None
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, at(self.c.regs, reg + i) as u8)
+        Some(out)
+
+// The port: the package's own functions over the double, and a pause that
+// is logged and not waited.
+struct Dut
+    bus: FakeI2c
+    w: DeviceWiring
+
+impl Es8311Port for Dut
+    fn setup(self) -> Bool [hw]
+        es8311.i2c_setup(self.bus, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        es8311.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        es8311.i2c_write(self.bus, self.w, reg, v)
+
+    fn pause_ms(self, ms: Int) [hw]
+        log_push(self.bus.c, lp(ms))
+        self.bus.c.st.insert(6, at(self.bus.c.st, 6) + 1)
+
+fn dut(c: Chip) -> Dut
+    Dut { bus: FakeI2c { c: c }, w: dev_bus.wiring_i2c(0, 0x18) }
+
+struct Link
+    st: HashMap<Int, Int>
+
+fn link() -> Link
+    Link { st: HashMap.new() }
+
+impl I2s for Link
+    fn configure(self, c: I2sConfig) -> Bool [hw]
+        self.st.insert(0, at(self.st, 0) + 1)
+        if at(self.st, 8) == 1
+            return false
+        self.st.insert(1, c.sample_rate)
+        self.st.insert(2, c.bit_depth)
+        self.st.insert(3, c.channels)
+        if c.role == I2sRole.I2sMaster
+            self.st.insert(4, 0)
+        else
+            self.st.insert(4, 1)
+        if c.format == I2sFormat.I2sPhilips
+            self.st.insert(5, 0)
+        else
+            self.st.insert(5, 1)
+        true
+
+    fn sample_rate(self) -> Int [hw]
+        at(self.st, 1)
+
+    fn enable(self) -> Bool [hw]
+        if at(self.st, 13) == 1
+            return false
+        self.st.insert(6, 1)
+        true
+
+    fn disable(self) [hw]
+        self.st.insert(6, 0)
+        self.st.insert(10, at(self.st, 10) + 1)
+
+    fn transmit(self, var buf: Vec[i32; 256]) -> Int [hw]
+        -1
+
+    fn receive(self, var buf: Vec[i32; 256], n: Int) -> Int [hw]
+        -1
+
+    fn xruns(self) -> Int [hw]
+        0
+
+fn fmt_of(rate: Int, depth: Int, ch: Int, framing: AudioFraming, master: Bool) -> AudioFormat
+    AudioFormat { sample_rate: rate, bit_depth: depth, channels: ch, framing: framing,
+                  codec_is_master: master }
+
+fn cfg_ratio(r: Int) -> Es8311Config
+    Es8311Config { mclk_ratio: r, invert_mclk: false, invert_sclk: false, digital_mic: false }
+
+// ── The bus framing ──────────────────────────────────────────────────
+
+@test
+fn test_a_write_is_the_register_then_the_value_in_one_transaction() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(d.write_reg(0x32, 0xBF))
+    test.assert_eq(reg_of(c, 0x32), 0xBF)
+    log_is(c, [lw(0x32, 0xBF)])
+
+@test
+fn test_a_read_is_a_write_of_the_register_and_a_repeated_start() [io, hw]
+    let c = chip()
+    c.regs.insert(0x32, 0x77)
+    let d = dut(c)
+    test.assert(es8311.reg_read(d, 0x32) == Some(0x77))
+    log_is(c, [lr(0x32)])
+    c.st.insert(5, 0x32 + 1)
+    test.assert(es8311.reg_read(d, 0x32) == None)
+
+@test
+fn test_setup_sets_the_bus_to_400_khz_and_needs_an_address() [io, hw]
+    let c = chip()
+    test.assert(dut(c).setup())
+    test.assert_eq(at(c.st, 4), 400000)
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    test.assert(not Dut { bus: FakeI2c { c: c }, w: w }.setup())
+
+@test
+fn test_a_part_that_is_not_there_refuses_every_transaction() [io, hw]
+    let c = chip()
+    c.st.insert(0, 0)
+    let d = dut(c)
+    test.assert(not d.write_reg(0x32, 1))
+    test.assert(es8311.reg_read(d, 0x32) == None)
+    test.assert(not es8311.reg_update(d, 0x32, 0xFF, 1))
+    test.assert(es8311.id_read(d) == None)
+
+@test
+fn test_an_update_keeps_the_bits_outside_the_mask() [io, hw]
+    let c = chip()
+    c.regs.insert(0x14, 0x5A)
+    let d = dut(c)
+    test.assert(es8311.reg_update(d, 0x14, 0x0F, 0x03))
+    test.assert_eq(reg_of(c, 0x14), 0x53)
+    log_is(c, [lr(0x14), lw(0x14, 0x53)])
+    c.st.insert(5, 0x14 + 1)
+    test.assert(not es8311.reg_update(d, 0x14, 0x0F, 0x03))
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_chip_id_is_83_11_and_the_version_is_the_revision() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    match es8311.id_read(d)
+        Some(id) =>
+            test.assert_eq(id.who, 0x8311)
+            test.assert(id.rev == Some(0x0A))
+        None => test.assert(false)
+    log_is(c, [lr(0xFD), lr(0xFE), lr(0xFF)])
+
+@test
+fn test_another_id_or_a_silent_part_is_not_an_es8311() [io, hw]
+    let c = chip()
+    c.regs.insert(0xFD, 0x84)
+    test.assert(es8311.id_read(dut(c)) == None)
+    log_clear(c)
+    let c2 = chip()
+    c2.regs.insert(0xFE, 0x12)
+    test.assert(es8311.id_read(dut(c2)) == None)
+    let c3 = chip()
+    c3.st.insert(5, 0xFD + 1)
+    test.assert(es8311.id_read(dut(c3)) == None)
+    let c4 = chip()
+    c4.st.insert(5, 0xFE + 1)
+    test.assert(es8311.id_read(dut(c4)) == None)
+    let c5 = chip()
+    c5.st.insert(5, 0xFF + 1)
+    match es8311.id_read(dut(c5))
+        Some(id) =>
+            test.assert_eq(id.who, 0x8311)
+            test.assert(id.rev == None)
+        None => test.assert(false)
+
+// ── The clock plan ───────────────────────────────────────────────────
+
+fn plan_is(p: ?ClockPlan, pre: Int, mult: Int, code: Int)
+    match p
+        Some(q) =>
+            test.assert_eq(q.pre_div, pre)
+            test.assert_eq(q.mult, mult)
+            test.assert_eq(q.mult_code, code)
+        None => test.assert(false)
+
+// A master clock of 256 x fs needs neither a divider nor a multiplier at
+// the four rates of the brief's common set.
+@test
+fn test_256fs_needs_no_divider_at_8_16_44_1_and_48_khz() [io]
+    plan_is(es8311.clock_plan(2048000, 8000, 512000), 1, 1, 0)
+    plan_is(es8311.clock_plan(4096000, 16000, 1024000), 1, 1, 0)
+    plan_is(es8311.clock_plan(11289600, 44100, 2822400), 1, 1, 0)
+    plan_is(es8311.clock_plan(12288000, 48000, 3072000), 1, 1, 0)
+
+// The rows of the reference tables for other master clocks: the dividers
+// and multipliers they list, as register codes 0 to 3 for 1x to 8x.
+@test
+fn test_the_dividers_and_multipliers_of_the_reference_tables() [io]
+    plan_is(es8311.clock_plan(12288000, 8000, 512000), 6, 1, 0)
+    plan_is(es8311.clock_plan(12288000, 16000, 512000), 3, 1, 0)
+    plan_is(es8311.clock_plan(12288000, 32000, 512000), 3, 2, 1)
+    plan_is(es8311.clock_plan(18432000, 48000, 512000), 3, 2, 1)
+    plan_is(es8311.clock_plan(1536000, 48000, 512000), 1, 8, 3)
+    plan_is(es8311.clock_plan(11289600, 22050, 512000), 2, 1, 0)
+    plan_is(es8311.clock_plan(6144000, 16000, 512000), 3, 2, 1)
+    plan_is(es8311.clock_plan(12288000, 96000, 512000), 1, 2, 1)
+    plan_is(es8311.clock_plan(2048000, 16000, 512000), 1, 2, 1)
+    plan_is(es8311.clock_plan(1024000, 8000, 512000), 1, 2, 1)
+    plan_is(es8311.clock_plan(3072000, 12000, 512000), 1, 1, 0)
+    plan_is(es8311.clock_plan(768000, 12000, 512000), 1, 4, 2)
+
+@test
+fn test_a_clock_that_does_not_make_256fs_is_refused() [io]
+    test.assert(es8311.clock_plan(12000000, 48000, 3072000) == None)
+    test.assert(es8311.clock_plan(18432000, 8000, 512000) == None)
+    test.assert(es8311.clock_plan(18432000, 16000, 512000) == None)
+    test.assert(es8311.clock_plan(0, 16000, 512000) == None)
+    test.assert(es8311.clock_plan(4096000, 16000, 0) == None)
+
+@test
+fn test_the_rate_must_be_8_to_96_khz() [io]
+    test.assert(es8311.clock_plan(2047744, 7999, 512000) == None)
+    plan_is(es8311.clock_plan(2048000, 8000, 512000), 1, 1, 0)
+    plan_is(es8311.clock_plan(24576000, 96000, 512000), 1, 1, 0)
+    test.assert(es8311.clock_plan(24576256, 96001, 512000) == None)
+
+@test
+fn test_the_dac_oversampling_is_64_up_to_16_khz() [io]
+    match es8311.clock_plan(4096000, 16000, 1024000)
+        Some(p) =>
+            test.assert_eq(p.dac_osr, 0x20)
+            test.assert_eq(p.adc_osr, 0x10)
+        None => test.assert(false)
+    match es8311.clock_plan(4096256, 16001, 1024000)
+        Some(p) => test.assert_eq(p.dac_osr, 0x10)
+        None => test.assert(false)
+    match es8311.clock_plan(11289600, 44100, 2822400)
+        Some(p) => test.assert_eq(p.dac_osr, 0x10)
+        None => test.assert(false)
+
+@test
+fn test_the_bit_clock_divider_is_the_digital_clock_over_the_bit_clock() [io]
+    match es8311.clock_plan(12288000, 48000, 3072000)
+        Some(p) => test.assert_eq(p.bclk_div, 4)
+        None => test.assert(false)
+    match es8311.clock_plan(4096000, 16000, 512000)
+        Some(p) => test.assert_eq(p.bclk_div, 8)
+        None => test.assert(false)
+    match es8311.clock_plan(12288000, 48000, 2304000)
+        Some(p) => test.assert_eq(p.bclk_div, 0)
+        None => test.assert(false)
+
+@test
+fn test_the_bclk_code_is_the_divider_less_one_up_to_18() [io]
+    test.assert_eq(es8311.bclk_code(1), 0)
+    test.assert_eq(es8311.bclk_code(4), 3)
+    test.assert_eq(es8311.bclk_code(18), 17)
+    test.assert_eq(es8311.bclk_code(0), -1)
+    test.assert_eq(es8311.bclk_code(19), -1)
+
+@test
+fn test_the_word_length_and_format_codes() [io]
+    test.assert_eq(es8311.wl_code(16), 3)
+    test.assert_eq(es8311.wl_code(24), 0)
+    test.assert_eq(es8311.wl_code(32), 4)
+    test.assert_eq(es8311.wl_code(8), -1)
+    test.assert_eq(es8311.fmt_code(AudioFraming.AudioPhilips), 0)
+    test.assert_eq(es8311.fmt_code(AudioFraming.AudioLeftJustified), 1)
+
+@test
+fn test_the_master_clock_follows_the_ratio_or_the_bit_clock() [io]
+    test.assert_eq(es8311.mclk_of(cfg_ratio(256), 48000, 3072000), 12288000)
+    test.assert_eq(es8311.mclk_of(cfg_ratio(384), 8000, 512000), 3072000)
+    test.assert_eq(es8311.mclk_of(es8311.config_sclk(), 48000, 3072000), 3072000)
+    test.assert_eq(es8311.config_default().mclk_ratio, 256)
+
+@test
+fn test_the_clock_source_bits() [io]
+    test.assert_eq(es8311.clock_source_bits(es8311.config_default()), 0)
+    test.assert_eq(es8311.clock_source_bits(es8311.config_sclk()), 0x80)
+    let both = Es8311Config { mclk_ratio: 0, invert_mclk: true, invert_sclk: false, digital_mic: false }
+    test.assert_eq(es8311.clock_source_bits(both), 0xC0)
+
+@test
+fn test_the_plan_for_a_format() [io]
+    let c = es8311.config_default()
+    match es8311.plan_of(c, fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false))
+        Some(p) =>
+            test.assert_eq(p.pre_div, 1)
+            test.assert_eq(p.mult, 1)
+            test.assert_eq(p.bclk_div, 4)
+        None => test.assert(false)
+    // 24-bit slots make a bit clock of 48 fs: fine for a slave, refused for
+    // a master, which cannot divide it.
+    test.assert(es8311.plan_of(c, fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false)) != None)
+    test.assert(es8311.plan_of(c, fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, true)) == None)
+    test.assert(es8311.plan_of(c, fmt_of(48000, 8, 2, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(es8311.plan_of(c, fmt_of(0, 16, 2, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(es8311.plan_of(c, fmt_of(48000, 16, 3, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(es8311.plan_of(c, fmt_of(7000, 16, 2, AudioFraming.AudioPhilips, false)) == None)
+
+// With no master clock the bit clock is the clock: 16-bit stereo is 32 fs,
+// multiplied by 8; 32-bit stereo is 64 fs, by 4; 24-bit, 48 fs, and 16-bit
+// mono, 16 fs, have no multiplier.
+@test
+fn test_the_bit_clock_as_the_master_clock() [io]
+    let c = es8311.config_sclk()
+    match es8311.plan_of(c, fmt_of(16000, 16, 2, AudioFraming.AudioPhilips, false))
+        Some(p) =>
+            test.assert_eq(p.mult, 8)
+            test.assert_eq(p.pre_div, 1)
+        None => test.assert(false)
+    match es8311.plan_of(c, fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false))
+        Some(p) => test.assert_eq(p.mult, 4)
+        None => test.assert(false)
+    test.assert(es8311.plan_of(c, fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(es8311.plan_of(c, fmt_of(16000, 16, 1, AudioFraming.AudioPhilips, false)) == None)
+
+@test
+fn test_the_i2s_settings_for_a_format() [io]
+    let a = es8311.i2s_config_of(fmt_of(44100, 16, 2, AudioFraming.AudioPhilips, false))
+    test.assert_eq(a.sample_rate, 44100)
+    test.assert_eq(a.bit_depth, 16)
+    test.assert_eq(a.channels, 2)
+    test.assert(a.role == I2sRole.I2sMaster)
+    test.assert(a.format == I2sFormat.I2sPhilips)
+    let b = es8311.i2s_config_of(fmt_of(44100, 16, 1, AudioFraming.AudioLeftJustified, true))
+    test.assert(b.role == I2sRole.I2sSlave)
+    test.assert(b.format == I2sFormat.I2sLeftJustified)
+
+// ── The steps ────────────────────────────────────────────────────────
+
+@test
+fn test_the_reset_holds_20_ms_between_1f_and_0() [io, hw]
+    let c = chip()
+    test.assert(es8311.step_reset(dut(c)))
+    log_is(c, [lw(0, 0x1F), lp(20), lw(0, 0), lw(0, 0x80)])
+
+@test
+fn test_a_reset_that_is_refused_does_not_wait() [io, hw]
+    let c = chip()
+    c.st.insert(2, 1)
+    test.assert(not es8311.step_reset(dut(c)))
+    log_is(c, [lw(0, 0x1F)])
+    let c2 = chip()
+    c2.st.insert(2, 2)
+    test.assert(not es8311.step_reset(dut(c2)))
+    log_is(c2, [lw(0, 0x1F), lp(20), lw(0, 0)])
+
+fn open_log(src: Int, sys3: Bool) -> [Int]
+    var head: [Int] = [lr(0x0D)]
+    if sys3
+        head = [lr(0x0D), lw(0x0D, 0xFA)]
+    list.concat(head, [lw(0x44, 0x08), lw(1, 0x30 | src), lw(2, 0), lw(3, 0x10), lw(0x16, 0x24), lw(4, 0x10), lw(5, 0), lw(0x0B, 0), lw(0x0C, 0), lw(0x10, 0x1F), lw(0x11, 0x7F), lw(0x13, 0x10), lw(0x1B, 0x0A), lw(0x1C, 0x6A), lw(0x44, 0x08)])
+
+@test
+fn test_the_base_state_after_the_reset() [io, hw]
+    let c = chip()
+    test.assert(es8311.step_open(dut(c), es8311.config_default()))
+    log_is(c, open_log(0, true))
+    test.assert_eq(reg_of(c, 0x1C), 0x6A)
+    test.assert_eq(reg_of(c, 0x13), 0x10)
+
+@test
+fn test_the_base_state_leaves_a_powered_down_part_alone() [io, hw]
+    let c = chip()
+    c.regs.insert(0x0D, 0xFA)
+    test.assert(es8311.step_open(dut(c), es8311.config_default()))
+    log_is(c, open_log(0, false))
+
+@test
+fn test_the_base_state_takes_the_clock_source_of_the_configuration() [io, hw]
+    let c = chip()
+    test.assert(es8311.step_open(dut(c), es8311.config_sclk()))
+    log_is(c, open_log(0x80, true))
+
+// The first write to the noise-immunity register may be dropped: it is
+// written again.
+@test
+fn test_the_first_write_to_register_44_is_retried_once() [io, hw]
+    let c = chip()
+    c.st.insert(3, 1)
+    test.assert(es8311.step_open(dut(c), es8311.config_default()))
+    let n = at(c.st, 9)
+    test.assert_eq(n, 18)
+    test.assert_eq(at(c.log, 2), lw(0x44, 0x08))
+    test.assert_eq(at(c.log, 3), lw(0x44, 0x08))
+    test.assert_eq(at(c.log, 4), lw(1, 0x30))
+
+@test
+fn test_the_base_state_stops_at_a_refused_write() [io, hw]
+    let c = chip()
+    c.st.insert(2, 1)
+    test.assert(not es8311.step_open(dut(c), es8311.config_default()))
+    log_is(c, [lr(0x0D), lw(0x0D, 0xFA)])
+    let c2 = chip()
+    c2.st.insert(2, 2)
+    test.assert(not es8311.step_open(dut(c2), es8311.config_default()))
+    log_is(c2, [lr(0x0D), lw(0x0D, 0xFA), lw(0x44, 0x08), lw(0x44, 0x08)])
+    let c3 = chip()
+    c3.st.insert(5, 0x0D + 1)
+    test.assert(not es8311.step_open(dut(c3), es8311.config_default()))
+    log_is(c3, [lr(0x0D)])
+    let c4 = chip()
+    c4.regs.insert(0x0D, 0xFA)
+    c4.st.insert(2, 1)
+    test.assert(not es8311.step_open(dut(c4), es8311.config_default()))
+
+@test
+fn test_start_reads_the_id_then_resets_then_opens() [io, hw]
+    let c = chip()
+    test.assert(es8311.start(dut(c), es8311.config_default()))
+    test.assert_eq(at(c.st, 4), 400000)
+    let head = [lr(0xFD), lr(0xFE), lr(0xFF), lw(0, 0x1F), lp(20), lw(0, 0), lw(0, 0x80)]
+    log_is(c, list.concat(head, open_log(0, true)))
+
+@test
+fn test_start_refuses_another_part_without_a_write() [io, hw]
+    let c = chip()
+    c.regs.insert(0xFD, 0x00)
+    test.assert(not es8311.start(dut(c), es8311.config_default()))
+    log_is(c, [lr(0xFD), lr(0xFE)])
+    test.assert_eq(at(c.st, 1), 0)
+
+@test
+fn test_start_needs_a_wiring_with_an_address() [io, hw]
+    let c = chip()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    test.assert(not es8311.start(Dut { bus: FakeI2c { c: c }, w: w }, es8311.config_default()))
+    test.assert_eq(at(c.st, 9), 0)
+
+@test
+fn test_start_reports_a_reset_or_a_base_state_that_was_refused() [io, hw]
+    let c = chip()
+    c.st.insert(2, 1)
+    test.assert(not es8311.start(dut(c), es8311.config_default()))
+    let c2 = chip()
+    c2.st.insert(2, 5)
+    test.assert(not es8311.start(dut(c2), es8311.config_default()))
+
+// ── The format ───────────────────────────────────────────────────────
+
+@test
+fn test_48_khz_32_bit_stereo_in_the_i2s_format() [io, hw]
+    let c = chip()
+    let l = link()
+    let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
+    test.assert(es8311.format_set(dut(c), l, es8311.config_default(), f))
+    log_is(c, [lw(0, 0x80), lw(1, 0x30), lr(2), lw(2, 0), lr(3), lw(3, 0x10), lr(4), lw(4, 0x10), lw(5, 0), lr(6), lw(6, 3), lr(7), lw(7, 0), lw(8, 0xFF), lr(9), lw(9, 0x10), lr(10), lw(10, 0x10)])
+    test.assert_eq(at(l.st, 0), 1)
+    test.assert_eq(at(l.st, 1), 48000)
+    test.assert_eq(at(l.st, 2), 32)
+    test.assert_eq(at(l.st, 3), 2)
+    test.assert_eq(at(l.st, 4), 0)
+    test.assert_eq(at(l.st, 5), 0)
+    test.assert_eq(at(l.st, 6), 1)
+
+// 8 kHz from a 12.288 MHz clock divides by 6, and the DAC oversamples
+// more at a low rate; 16 bits in the left-justified format.
+@test
+fn test_8_khz_16_bit_from_12_288_mhz_left_justified() [io, hw]
+    let c = chip()
+    let l = link()
+    let f = fmt_of(8000, 16, 2, AudioFraming.AudioLeftJustified, false)
+    test.assert(es8311.format_set(dut(c), l, cfg_ratio(1536), f))
+    log_is(c, [lw(0, 0x80), lw(1, 0x30), lr(2), lw(2, 0xA0), lr(3), lw(3, 0x10), lr(4), lw(4, 0x20), lw(5, 0), lr(6), lw(6, 3), lr(7), lw(7, 0), lw(8, 0xFF), lr(9), lw(9, 0x0D), lr(10), lw(10, 0x0D)])
+    test.assert_eq(at(l.st, 5), 1)
+
+@test
+fn test_32_khz_from_12_288_mhz_divides_by_3_and_multiplies_by_2() [io, hw]
+    let c = chip()
+    let f = fmt_of(32000, 16, 2, AudioFraming.AudioPhilips, false)
+    test.assert(es8311.format_set(dut(c), link(), cfg_ratio(384), f))
+    test.assert_eq(reg_of(c, 2), 0x48)
+
+@test
+fn test_44_1_khz_24_bit_has_word_length_zero() [io, hw]
+    let c = chip()
+    let f = fmt_of(44100, 24, 2, AudioFraming.AudioPhilips, false)
+    test.assert(es8311.format_set(dut(c), link(), es8311.config_default(), f))
+    test.assert_eq(reg_of(c, 9), 0x00)
+    test.assert_eq(reg_of(c, 10), 0x00)
+    test.assert_eq(reg_of(c, 2), 0x00)
+    test.assert_eq(reg_of(c, 4), 0x10)
+
+// As the codec is master it sets the bit clock divider: 16 kHz, 16 bits,
+// stereo is 512 kHz from 4.096 MHz, a divider of 8.
+@test
+fn test_a_master_codec_sets_the_master_bit_and_the_bit_clock_divider() [io, hw]
+    let c = chip()
+    let l = link()
+    let f = fmt_of(16000, 16, 2, AudioFraming.AudioPhilips, true)
+    test.assert(es8311.format_set(dut(c), l, es8311.config_default(), f))
+    log_is(c, [lw(0, 0xC0), lw(1, 0x30), lr(2), lw(2, 0), lr(3), lw(3, 0x10), lr(4), lw(4, 0x20), lw(5, 0), lr(6), lw(6, 7), lr(7), lw(7, 0), lw(8, 0xFF), lr(9), lw(9, 0x0C), lr(10), lw(10, 0x0C)])
+    test.assert_eq(at(l.st, 4), 1)
+
+@test
+fn test_with_no_master_clock_the_bit_clock_is_multiplied_by_8() [io, hw]
+    let c = chip()
+    let f = fmt_of(16000, 16, 2, AudioFraming.AudioPhilips, false)
+    test.assert(es8311.format_set(dut(c), link(), es8311.config_sclk(), f))
+    test.assert_eq(reg_of(c, 1), 0xB0)
+    test.assert_eq(reg_of(c, 2), 0x18)
+
+@test
+fn test_the_inversions_reach_clkmgr1_and_clkmgr6() [io, hw]
+    let c = chip()
+    let cfg = Es8311Config { mclk_ratio: 256, invert_mclk: true, invert_sclk: true, digital_mic: false }
+    let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
+    test.assert(es8311.format_set(dut(c), link(), cfg, f))
+    test.assert_eq(reg_of(c, 1), 0x70)
+    test.assert_eq(reg_of(c, 6), 0x23)
+
+// The word-length field is written whole: a port that was 32 bits wide and
+// is set to 16 holds no stale bit.
+@test
+fn test_a_port_set_from_32_bits_to_16_keeps_no_stale_bit() [io, hw]
+    let c = chip()
+    c.regs.insert(9, 0x1C)
+    c.regs.insert(10, 0x1D)
+    let f = fmt_of(16000, 16, 2, AudioFraming.AudioPhilips, false)
+    test.assert(es8311.format_set(dut(c), link(), es8311.config_default(), f))
+    test.assert_eq(reg_of(c, 9), 0x0C)
+    test.assert_eq(reg_of(c, 10), 0x0C)
+
+// The mute bit and the DAC's slot select stay, and so do the low bits of
+// the divider registers the part's reset values set.
+@test
+fn test_the_format_keeps_the_bits_it_does_not_own() [io, hw]
+    let c = chip()
+    c.regs.insert(9, 0xC0)
+    c.regs.insert(10, 0x40)
+    c.regs.insert(2, 0x07)
+    c.regs.insert(3, 0x80)
+    c.regs.insert(4, 0x80)
+    c.regs.insert(6, 0xC0)
+    c.regs.insert(7, 0xC0)
+    let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
+    test.assert(es8311.format_set(dut(c), link(), es8311.config_default(), f))
+    test.assert_eq(reg_of(c, 9), 0xD0)
+    test.assert_eq(reg_of(c, 10), 0x50)
+    test.assert_eq(reg_of(c, 2), 0x07)
+    test.assert_eq(reg_of(c, 3), 0x90)
+    test.assert_eq(reg_of(c, 4), 0x90)
+    test.assert_eq(reg_of(c, 6), 0xC3)
+    test.assert_eq(reg_of(c, 7), 0xC0)
+
+@test
+fn test_a_format_the_codec_or_the_handle_cannot_take_writes_nothing() [io, hw]
+    let c = chip()
+    let l = link()
+    test.assert(not es8311.format_set(dut(c), l, es8311.config_default(), fmt_of(48000, 8, 2, AudioFraming.AudioPhilips, false)))
+    test.assert_eq(at(l.st, 0), 0)
+    l.st.insert(8, 1)
+    let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
+    test.assert(not es8311.format_set(dut(c), l, es8311.config_default(), f))
+    test.assert_eq(at(l.st, 6), 0)
+    let k = link()
+    k.st.insert(13, 1)
+    test.assert(not es8311.format_set(dut(c), k, es8311.config_default(), f))
+    test.assert_eq(at(k.st, 0), 1)
+    test.assert_eq(at(c.st, 9), 0)
+
+@test
+fn test_a_write_refused_part_way_through_the_format_is_reported() [io, hw]
+    let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
+    for k in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        let c = chip()
+        c.st.insert(2, k)
+        test.assert(not es8311.format_set(dut(c), link(), es8311.config_default(), f))
+
+// ── DSP mode, slot and the other settings ────────────────────────────
+
+@test
+fn test_dsp_mode_a_and_b_at_16_bits() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8311.dsp_format_set(d, 16, false))
+    test.assert_eq(reg_of(c, 9), 0x0F)
+    test.assert_eq(reg_of(c, 10), 0x0F)
+    test.assert(es8311.dsp_format_set(d, 16, true))
+    test.assert_eq(reg_of(c, 9), 0x2F)
+    test.assert(not es8311.dsp_format_set(d, 8, true))
+
+@test
+fn test_the_dac_slot_is_bit_7_of_the_input_port() [io, hw]
+    let c = chip()
+    c.regs.insert(9, 0x0C)
+    let d = dut(c)
+    test.assert(es8311.dac_slot_set(d, true))
+    test.assert_eq(reg_of(c, 9), 0x8C)
+    test.assert(es8311.dac_slot_set(d, false))
+    test.assert_eq(reg_of(c, 9), 0x0C)
+
+@test
+fn test_the_microphone_and_headphone_switches_keep_their_neighbours() [io, hw]
+    let c = chip()
+    c.regs.insert(0x14, 0x1A)
+    c.regs.insert(0x13, 0x01)
+    let d = dut(c)
+    test.assert(es8311.dmic_set(d, true))
+    test.assert_eq(reg_of(c, 0x14), 0x5A)
+    test.assert(es8311.dmic_set(d, false))
+    test.assert_eq(reg_of(c, 0x14), 0x1A)
+    test.assert(es8311.headphone_set(d, true))
+    test.assert_eq(reg_of(c, 0x13), 0x11)
+    test.assert(es8311.headphone_set(d, false))
+    test.assert_eq(reg_of(c, 0x13), 0x01)
+
+// ── Power ────────────────────────────────────────────────────────────
+
+// The DAC is muted (register 0x31) before it is powered (0x12), and the
+// serial ports' mute bits are cleared.
+@test
+fn test_power_up_mutes_the_dac_before_it_powers_it() [io, hw]
+    let c = chip()
+    c.regs.insert(0, 0x80)
+    c.regs.insert(1, 0x30)
+    c.regs.insert(9, 0x40)
+    c.regs.insert(10, 0x40)
+    let l = link()
+    test.assert(es8311.power_set(dut(c), l, es8311.config_default(), true))
+    log_is(c, [lr(0), lw(0, 0x80), lr(1), lw(1, 0x3F), lr(9), lw(9, 0), lr(10), lw(10, 0), lw(0x31, 0x60), lw(0x17, 0xBF), lw(0x0E, 2), lw(0x12, 0), lw(0x14, 0x1A), lw(0x0D, 1), lw(0x15, 0x40), lw(0x37, 8), lw(0x45, 0)])
+    test.assert_eq(at(l.st, 10), 0)
+
+@test
+fn test_power_up_keeps_the_role_and_the_source_and_takes_the_digital_mic() [io, hw]
+    let c = chip()
+    c.regs.insert(0, 0xC0)
+    c.regs.insert(1, 0xB0)
+    let cfg = Es8311Config { mclk_ratio: 0, invert_mclk: false, invert_sclk: false, digital_mic: true }
+    test.assert(es8311.power_set(dut(c), link(), cfg, true))
+    test.assert_eq(reg_of(c, 0), 0xC0)
+    test.assert_eq(reg_of(c, 1), 0xBF)
+    test.assert_eq(reg_of(c, 0x14), 0x5A)
+
+@test
+fn test_power_up_sets_the_state_machine_on_when_the_part_was_reset() [io, hw]
+    let c = chip()
+    test.assert(es8311.power_set(dut(c), link(), es8311.config_default(), true))
+    test.assert_eq(reg_of(c, 0), 0x80)
+
+@test
+fn test_power_down_follows_the_suspend_sequence_and_stops_the_handle() [io, hw]
+    let c = chip()
+    let l = link()
+    test.assert(es8311.power_set(dut(c), l, es8311.config_default(), false))
+    log_is(c, [lw(0x31, 0x60), lw(0x32, 0), lw(0x17, 0), lw(0x0E, 0xFF), lw(0x12, 2), lw(0x14, 0), lw(0x0D, 0xFA), lw(0x15, 0), lw(2, 0x10), lw(0, 0), lw(0, 0x1F), lw(1, 0x30), lw(1, 0), lw(0x45, 0), lw(0x0D, 0xFC), lw(2, 0)])
+    test.assert_eq(at(l.st, 10), 1)
+
+@test
+fn test_a_power_down_that_fails_still_stops_the_handle() [io, hw]
+    let c = chip()
+    c.st.insert(2, 3)
+    let l = link()
+    test.assert(not es8311.power_set(dut(c), l, es8311.config_default(), false))
+    test.assert_eq(at(l.st, 10), 1)
+
+@test
+fn test_a_power_up_that_fails_is_reported() [io, hw]
+    for k in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        let c = chip()
+        c.st.insert(2, k)
+        test.assert(not es8311.power_set(dut(c), link(), es8311.config_default(), true))
+
+// ── Mute and gain ────────────────────────────────────────────────────
+
+@test
+fn test_mute_sets_both_bits_and_unmute_clears_them_keeping_the_rest() [io, hw]
+    let c = chip()
+    c.regs.insert(0x31, 0x9F)
+    let d = dut(c)
+    test.assert(es8311.mute_set(d, true))
+    test.assert_eq(reg_of(c, 0x31), 0xFF)
+    log_is(c, [lr(0x31), lw(0x31, 0xFF)])
+    test.assert(es8311.mute_set(d, false))
+    test.assert_eq(reg_of(c, 0x31), 0x9F)
+
+@test
+fn test_muted_means_both_bits() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x31, 0x60)
+    test.assert(es8311.mute_get(d) == Some(true))
+    c.regs.insert(0x31, 0x40)
+    test.assert(es8311.mute_get(d) == Some(false))
+    c.regs.insert(0x31, 0x00)
+    test.assert(es8311.mute_get(d) == Some(false))
+    c.st.insert(5, 0x31 + 1)
+    test.assert(es8311.mute_get(d) == None)
+
+fn out_gain(c: Chip, mdb: Int) -> ?MilliDb
+    es8311.gain_set(dut(c), CodecPath.CodecOutput, MilliDb { mdb: mdb })
+
+// Code 191 is 0 dB (-95.5 dB + 191 x 0.5 dB); the step is never above the
+// request.
+@test
+fn test_the_output_volume_is_the_largest_step_not_above_the_request() [io, hw]
+    let c = chip()
+    test.assert(out_gain(c, 0) == Some(MilliDb { mdb: 0 }))
+    test.assert_eq(reg_of(c, 0x32), 191)
+    log_is(c, [lw(0x32, 191)])
+    test.assert(out_gain(c, 250) == Some(MilliDb { mdb: 0 }))
+    test.assert_eq(reg_of(c, 0x32), 191)
+    test.assert(out_gain(c, -1) == Some(MilliDb { mdb: -500 }))
+    test.assert_eq(reg_of(c, 0x32), 190)
+    test.assert(out_gain(c, -95500) == Some(MilliDb { mdb: -95500 }))
+    test.assert_eq(reg_of(c, 0x32), 0)
+    test.assert(out_gain(c, 32000) == Some(MilliDb { mdb: 32000 }))
+    test.assert_eq(reg_of(c, 0x32), 255)
+    test.assert(out_gain(c, 50000) == Some(MilliDb { mdb: 32000 }))
+
+@test
+fn test_a_request_below_the_range_or_a_refused_write_sets_nothing() [io, hw]
+    let c = chip()
+    test.assert(out_gain(c, -95501) == None)
+    test.assert_eq(at(c.st, 9), 0)
+    c.st.insert(2, 1)
+    test.assert(out_gain(c, 0) == None)
+
+@test
+fn test_the_output_gain_reads_back_in_millidecibels() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x32, 0xBF)
+    test.assert(es8311.gain_get(d, CodecPath.CodecOutput) == Some(MilliDb { mdb: 0 }))
+    c.regs.insert(0x32, 0)
+    test.assert(es8311.gain_get(d, CodecPath.CodecOutput) == Some(MilliDb { mdb: -95500 }))
+    c.regs.insert(0x32, 255)
+    test.assert(es8311.gain_get(d, CodecPath.CodecOutput) == Some(MilliDb { mdb: 32000 }))
+    c.st.insert(5, 0x32 + 1)
+    test.assert(es8311.gain_get(d, CodecPath.CodecOutput) == None)
+
+fn in_gain(c: Chip, mdb: Int) -> ?MilliDb
+    es8311.gain_set(dut(c), CodecPath.CodecInput, MilliDb { mdb: mdb })
+
+@test
+fn test_the_input_gain_is_the_pga_first_then_the_scale() [io]
+    test.assert_eq(es8311.input_split(0).pga, 0)
+    test.assert_eq(es8311.input_split(0).scale, 0)
+    test.assert_eq(es8311.input_split(2999).pga, 0)
+    test.assert_eq(es8311.input_split(3000).pga, 1)
+    test.assert_eq(es8311.input_split(30000).pga, 10)
+    test.assert_eq(es8311.input_split(30000).scale, 0)
+    test.assert_eq(es8311.input_split(35999).scale, 0)
+    test.assert_eq(es8311.input_split(36000).scale, 1)
+    test.assert_eq(es8311.input_split(72000).scale, 7)
+    test.assert_eq(es8311.input_split(99000).pga, 10)
+    test.assert_eq(es8311.input_split(99000).scale, 7)
+    test.assert_eq(es8311.input_mdb(InputGain { pga: 10, scale: 7 }), 72000)
+    test.assert_eq(es8311.input_mdb(InputGain { pga: 3, scale: 0 }), 9000)
+
+@test
+fn test_the_input_gain_writes_the_pga_and_the_scale_keeping_the_other_bits() [io, hw]
+    let c = chip()
+    c.regs.insert(0x14, 0x5A)
+    c.regs.insert(0x16, 0x24)
+    test.assert(in_gain(c, 36500) == Some(MilliDb { mdb: 36000 }))
+    log_is(c, [lr(0x14), lw(0x14, 0x5A), lr(0x16), lw(0x16, 0x21)])
+    test.assert(in_gain(c, 10000) == Some(MilliDb { mdb: 9000 }))
+    test.assert_eq(reg_of(c, 0x14), 0x53)
+    test.assert_eq(reg_of(c, 0x16), 0x20)
+    test.assert(in_gain(c, 200000) == Some(MilliDb { mdb: 72000 }))
+    test.assert_eq(reg_of(c, 0x14), 0x5A)
+    test.assert_eq(reg_of(c, 0x16), 0x27)
+
+@test
+fn test_a_negative_input_gain_or_a_refused_write_sets_nothing() [io, hw]
+    let c = chip()
+    test.assert(in_gain(c, -1) == None)
+    test.assert_eq(at(c.st, 9), 0)
+    c.st.insert(2, 1)
+    test.assert(in_gain(c, 3000) == None)
+    let c2 = chip()
+    c2.st.insert(2, 2)
+    test.assert(in_gain(c2, 3000) == None)
+
+@test
+fn test_the_input_gain_reads_back_and_clamps_a_pga_code_above_10() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x14, 0x1A)
+    c.regs.insert(0x16, 0x24)
+    test.assert(es8311.gain_get(d, CodecPath.CodecInput) == Some(MilliDb { mdb: 54000 }))
+    c.regs.insert(0x14, 0x1F)
+    test.assert(es8311.gain_get(d, CodecPath.CodecInput) == Some(MilliDb { mdb: 54000 }))
+    c.regs.insert(0x14, 0x00)
+    c.regs.insert(0x16, 0x00)
+    test.assert(es8311.gain_get(d, CodecPath.CodecInput) == Some(MilliDb { mdb: 0 }))
+    c.st.insert(5, 0x14 + 1)
+    test.assert(es8311.gain_get(d, CodecPath.CodecInput) == None)
+    c.st.insert(5, 0x16 + 1)
+    test.assert(es8311.gain_get(d, CodecPath.CodecInput) == None)
+
+@test
+fn test_the_adc_volume_is_in_half_decibel_steps_from_minus_95_5() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8311.adc_volume_set(d, MilliDb { mdb: 0 }) == Some(MilliDb { mdb: 0 }))
+    test.assert_eq(reg_of(c, 0x17), 0xBF)
+    test.assert(es8311.adc_volume_get(d) == Some(MilliDb { mdb: 0 }))
+    test.assert(es8311.adc_volume_set(d, MilliDb { mdb: -100000 }) == None)
+    c.st.insert(5, 0x17 + 1)
+    test.assert(es8311.adc_volume_get(d) == None)
+    c.st.insert(2, 1)
+    test.assert(es8311.adc_volume_set(d, MilliDb { mdb: 0 }) == None)
+
+// ── The type over absent hardware ────────────────────────────────────
+
+fn absent() -> es8311.Es8311<Link>
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    es8311.attach(BoardI2c { id: 0 }, w, link(), es8311.config_default())
+
+@test
+fn test_the_type_over_absent_hardware_answers_as_a_part_that_is_not_there() [io, hw]
+    let p = absent()
+    test.assert(not p.begin())
+    test.assert(p.reg(0x32) == None)
+    test.assert(not p.set_reg(0x32, 1))
+    test.assert(p.set_adc_volume(MilliDb { mdb: 0 }) == None)
+    test.assert(p.adc_volume() == None)
+    test.assert(not p.set_dmic(true))
+    test.assert(not p.set_headphone(true))
+    test.assert(not p.set_dsp_format(16, false))
+    test.assert(not p.set_dac_slot(true))
+    test.assert(p.codec_set_mute(true) == false)
+    test.assert(p.codec_is_muted() == None)
+    test.assert(p.codec_set_gain(CodecPath.CodecOutput, MilliDb { mdb: 0 }) == None)
+    test.assert(p.codec_set_gain(CodecPath.CodecInput, MilliDb { mdb: 0 }) == None)
+    test.assert(p.codec_gain(CodecPath.CodecOutput) == None)
+    test.assert(p.codec_gain(CodecPath.CodecInput) == None)
+    test.assert(p.device_id() == None)
+    test.assert(not p.device_probe(0x8311))
+
+@test
+fn test_power_and_format_on_absent_hardware_report_false_and_stop_the_handle() [io, hw]
+    let p = absent()
+    test.assert(not p.codec_set_power(true))
+    test.assert(not p.codec_set_power(false))
+    let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
+    test.assert(not p.codec_set_format(f))
+    p.i2s_stop()
+
+// The real pause is the board's timer; one millisecond is waited here.
+@test
+fn test_the_pause_of_the_type_waits_on_the_boards_timer() [io, hw]
+    absent().pause_ms(1)
+    test.assert(true)
+
+@test
+fn test_the_type_builds_with_its_two_configurations() [io]
+    test.assert_eq(es8311.config_sclk().mclk_ratio, 0)
+    test.assert(not es8311.config_default().digital_mic)
