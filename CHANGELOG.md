@@ -28,13 +28,16 @@ codec on an I2C control bus and a board's I2S handle.
 - The suite runs over a double of the part and of the I2S handle and covers
   every line of `src/`.
 - The device program `examples/tone.nv`. Built for the nRF52840-DK it is
-  15,020 B of flash and for the nRF54LM20-DK 16,340 B.
+  20,176 B of flash and for the nRF54LM20-DK 21,624 B; before the Nordic buses
+  landed, with the reading path left out, it was 15,020 B and 16,340 B.
 
 ### Known
 
 - Hardware verification: NOT VERIFIED. No board carries an ES8311, and no
-  board package has an I2S block or, on the Nordic boards, an I2C driver. The
-  device program is given a stand-in handle and finds an absent bus.
+  board package has an I2S block. The Nordic DKs drive I2C with TWIM0 and
+  TWIM22, so the device program's images carry the reading path; a reply from
+  the codec over either bus is NOT VERIFIED. The device program is given a
+  stand-in handle.
 - The register map is from the reference drivers, not from Everest's data
   sheet, which could not be fetched: only the product brief, Revision 7.0,
   January 2020, is public. The reference drivers disagree on the DAC
