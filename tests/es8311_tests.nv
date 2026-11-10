@@ -926,7 +926,7 @@ fn test_the_type_over_absent_hardware_answers_as_a_part_that_is_not_there() [io,
     test.assert(not p.set_headphone(true))
     test.assert(not p.set_dsp_format(16, false))
     test.assert(not p.set_dac_slot(true))
-    test.assert(p.codec_set_mute(true) == false)
+    test.assert(not p.codec_set_mute(true))
     test.assert(p.codec_is_muted() == None)
     test.assert(p.codec_set_gain(CodecPath.CodecOutput, MilliDb { mdb: 0 }) == None)
     test.assert(p.codec_set_gain(CodecPath.CodecInput, MilliDb { mdb: 0 }) == None)
@@ -954,3 +954,42 @@ fn test_the_pause_of_the_type_waits_on_the_boards_timer() [io, hw]
 fn test_the_type_builds_with_its_two_configurations() [io]
     test.assert_eq(es8311.config_sclk().mclk_ratio, 0)
     test.assert(not es8311.config_default().digital_mic)
+
+// ── The steps and helpers by name ────────────────────────────────────
+
+@test
+fn test_the_clock_and_port_steps_by_name() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8311.step_source(d, es8311.config_default(), true))
+    log_is(c, [lw(0, 0xC0), lw(1, 0x30)])
+    match es8311.clock_plan(12288000, 8000, 512000)
+        Some(p) => test.assert(es8311.step_clocks(d, es8311.config_default(), p, 7))
+        None => test.assert(false)
+    log_is(c, [lr(2), lw(2, 0xA0), lr(3), lw(3, 0x10), lr(4), lw(4, 0x20), lw(5, 0), lr(6), lw(6, 7), lr(7), lw(7, 0), lw(8, 0xFF)])
+    test.assert(es8311.step_serial_port(d, 3, 1, true))
+    log_is(c, [lr(9), lw(9, 0x2D), lr(10), lw(10, 0x2D)])
+
+@test
+fn test_the_power_steps_by_name() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8311.step_power_up(d, es8311.config_default()))
+    test.assert_eq(reg_of(c, 0x31), 0x60)
+    test.assert_eq(reg_of(c, 0x12), 0x00)
+    test.assert_eq(reg_of(c, 0x0D), 0x01)
+    test.assert(es8311.step_power_down(d))
+    test.assert_eq(reg_of(c, 0x0D), 0xFC)
+    test.assert_eq(reg_of(c, 0x12), 0x02)
+    test.assert_eq(reg_of(c, 0x02), 0x00)
+
+@test
+fn test_a_register_write_is_eight_bits_and_the_volume_helpers_agree() [io, hw]
+    let c = chip()
+    test.assert(es8311.reg_write(dut(c), 0x32, 0x1BF))
+    test.assert_eq(reg_of(c, 0x32), 0xBF)
+    test.assert(es8311.volume_code(MilliDb { mdb: 0 }) == Some(191))
+    test.assert(es8311.volume_code(MilliDb { mdb: -96000 }) == None)
+    test.assert_eq(es8311.volume_mdb(191), 0)
+    test.assert_eq(es8311.volume_mdb(0), -95500)
+    test.assert_eq(es8311.volume_mdb(255), 32000)

@@ -52,3 +52,5 @@ codec on an I2C control bus and a board's I2S handle.
 - A local named `codec` breaks the embedded tier check
   (`a-local-named-like-a-stdlib-module-makes-the-embedded-tier-check-read-its-method-calls-as-module-calls`);
   the device program calls its codec `part`.
+- The linter's `char-literal` rule reads register numbers such as 0x30 as
+  characters. It is wrong for a register map, and those sites are left.
