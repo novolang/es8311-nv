@@ -29,9 +29,6 @@ codec on an I2C control bus and a board's I2S handle.
   every line of `src/`.
 - The device program `examples/tone.nv`. Built for the nRF52840-DK it is
   15,020 B of flash and for the nRF54LM20-DK 16,340 B.
-- `workaround(a-match-over-an-enum-whose-arms-answer-an-optional-struct-is-emitted-with-a-pointer-slot)`:
-  `gain_set` and `gain_get` compare the path where a `match` over
-  `CodecPath` would fail IR verification.
 
 ### Known
 

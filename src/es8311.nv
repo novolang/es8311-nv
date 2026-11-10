@@ -538,10 +538,9 @@ pub fn input_mdb(s: InputGain) -> Int
 // part did not take it.  Code 0 of the DAC is -95.5 dB, not silence; the
 // output is silenced by `mute_set`.
 pub fn gain_set<P: Es8311Port>(p: P, path: CodecPath, g: MilliDb) -> ?MilliDb [hw]
-    // workaround(a-match-over-an-enum-whose-arms-answer-an-optional-struct-is-emitted-with-a-pointer-slot): a match over an enum whose arms answer ?MilliDb fails IR verification, so the path is compared.
-    if path == CodecPath.CodecOutput
-        return output_gain_set(p, g)
-    input_gain_set(p, g)
+    match path
+        CodecPath.CodecOutput => output_gain_set(p, g)
+        CodecPath.CodecInput => input_gain_set(p, g)
 
 fn output_gain_set<P: Es8311Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
     let Some(code) = volume_code(g) else return None
@@ -562,10 +561,9 @@ fn input_gain_set<P: Es8311Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
 // The gain of a path as the part holds it, or `None` when it did not
 // answer.  An input PGA code above 10 is read as 10.
 pub fn gain_get<P: Es8311Port>(p: P, path: CodecPath) -> ?MilliDb [hw]
-    // workaround(a-match-over-an-enum-whose-arms-answer-an-optional-struct-is-emitted-with-a-pointer-slot): the same enum match over ?MilliDb arms, spelled as a comparison.
-    if path == CodecPath.CodecOutput
-        return output_gain_get(p)
-    input_gain_get(p)
+    match path
+        CodecPath.CodecOutput => output_gain_get(p)
+        CodecPath.CodecInput => input_gain_get(p)
 
 fn output_gain_get<P: Es8311Port>(p: P) -> ?MilliDb [hw]
     let Some(v) = reg_read(p, DAC2) else return None
