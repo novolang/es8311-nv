@@ -40,8 +40,8 @@ codec on an I2C control bus and a board's I2S handle.
   January 2020, is public. The reference drivers disagree on the DAC
   oversampling register and on the bit clock divider code above 18; the
   choices are named in `src/es8311.nv`.
-- The manifest names devices-nv and embedded-hal-nv by path: `AudioCodec`
-  and `I2s` are in the 0.3.3 releases, which are not on the registry.
+- The manifest names devices-nv and embedded-hal-nv by the registry range
+  `^0.3.3`, the first releases with `AudioCodec` and `I2s`.
 - Not implemented: the equalisers, the DAC's dynamic range compression, the
   ALC and automute, a master clock the divider and multiplier cannot make
   (12 MHz, and 18.432 MHz at 8 and 16 kHz), the right-justified format,
