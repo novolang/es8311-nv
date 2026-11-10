@@ -250,7 +250,7 @@ fn test_the_chip_id_is_83_11_and_the_version_is_the_revision() [io, hw]
         Some(id) =>
             test.assert_eq(id.who, 0x8311)
             test.assert(id.rev == Some(0x0A))
-        None => test.assert(false)
+        None     => test.assert(false)
     log_is(c, [lr(0xFD), lr(0xFE), lr(0xFF)])
 
 @test
@@ -274,7 +274,7 @@ fn test_another_id_or_a_silent_part_is_not_an_es8311() [io, hw]
         Some(id) =>
             test.assert_eq(id.who, 0x8311)
             test.assert(id.rev == None)
-        None => test.assert(false)
+        None     => test.assert(false)
 
 // ── The clock plan ───────────────────────────────────────────────────
 
@@ -284,7 +284,7 @@ fn plan_is(p: ?ClockPlan, pre: Int, mult: Int, code: Int)
             test.assert_eq(q.pre_div, pre)
             test.assert_eq(q.mult, mult)
             test.assert_eq(q.mult_code, code)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 // A master clock of 256 x fs needs neither a divider nor a multiplier at
 // the four rates of the brief's common set.
@@ -333,25 +333,25 @@ fn test_the_dac_oversampling_is_64_up_to_16_khz() [io]
         Some(p) =>
             test.assert_eq(p.dac_osr, 0x20)
             test.assert_eq(p.adc_osr, 0x10)
-        None => test.assert(false)
+        None    => test.assert(false)
     match es8311.clock_plan(4096256, 16001, 1024000)
         Some(p) => test.assert_eq(p.dac_osr, 0x10)
-        None => test.assert(false)
+        None    => test.assert(false)
     match es8311.clock_plan(11289600, 44100, 2822400)
         Some(p) => test.assert_eq(p.dac_osr, 0x10)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_the_bit_clock_divider_is_the_digital_clock_over_the_bit_clock() [io]
     match es8311.clock_plan(12288000, 48000, 3072000)
         Some(p) => test.assert_eq(p.bclk_div, 4)
-        None => test.assert(false)
+        None    => test.assert(false)
     match es8311.clock_plan(4096000, 16000, 512000)
         Some(p) => test.assert_eq(p.bclk_div, 8)
-        None => test.assert(false)
+        None    => test.assert(false)
     match es8311.clock_plan(12288000, 48000, 2304000)
         Some(p) => test.assert_eq(p.bclk_div, 0)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_the_bclk_code_is_the_divider_less_one_up_to_18() [io]
@@ -392,7 +392,7 @@ fn test_the_plan_for_a_format() [io]
             test.assert_eq(p.pre_div, 1)
             test.assert_eq(p.mult, 1)
             test.assert_eq(p.bclk_div, 4)
-        None => test.assert(false)
+        None    => test.assert(false)
     // 24-bit slots make a bit clock of 48 fs: fine for a slave, refused for
     // a master, which cannot divide it.
     test.assert(es8311.plan_of(c, fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false)) != None)
@@ -412,10 +412,10 @@ fn test_the_bit_clock_as_the_master_clock() [io]
         Some(p) =>
             test.assert_eq(p.mult, 8)
             test.assert_eq(p.pre_div, 1)
-        None => test.assert(false)
+        None    => test.assert(false)
     match es8311.plan_of(c, fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false))
         Some(p) => test.assert_eq(p.mult, 4)
-        None => test.assert(false)
+        None    => test.assert(false)
     test.assert(es8311.plan_of(c, fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false)) == None)
     test.assert(es8311.plan_of(c, fmt_of(16000, 16, 1, AudioFraming.AudioPhilips, false)) == None)
 
@@ -454,7 +454,21 @@ fn open_log(src: Int, sys3: Bool) -> [Int]
     var head: [Int] = [lr(0x0D)]
     if sys3
         head = [lr(0x0D), lw(0x0D, 0xFA)]
-    list.concat(head, [lw(0x44, 0x08), lw(1, 0x30 | src), lw(2, 0), lw(3, 0x10), lw(0x16, 0x24), lw(4, 0x10), lw(5, 0), lw(0x0B, 0), lw(0x0C, 0), lw(0x10, 0x1F), lw(0x11, 0x7F), lw(0x13, 0x10), lw(0x1B, 0x0A), lw(0x1C, 0x6A), lw(0x44, 0x08)])
+    list.concat(head, [lw(0x44, 0x08),
+        lw(1, 0x30 | src),
+        lw(2, 0),
+        lw(3, 0x10),
+        lw(0x16, 0x24),
+        lw(4, 0x10),
+        lw(5, 0),
+        lw(0x0B, 0),
+        lw(0x0C, 0),
+        lw(0x10, 0x1F),
+        lw(0x11, 0x7F),
+        lw(0x13, 0x10),
+        lw(0x1B, 0x0A),
+        lw(0x1C, 0x6A),
+        lw(0x44, 0x08)])
 
 @test
 fn test_the_base_state_after_the_reset() [io, hw]
@@ -549,7 +563,24 @@ fn test_48_khz_32_bit_stereo_in_the_i2s_format() [io, hw]
     let l = link()
     let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
     test.assert(es8311.format_set(dut(c), l, es8311.config_default(), f))
-    log_is(c, [lw(0, 0x80), lw(1, 0x30), lr(2), lw(2, 0), lr(3), lw(3, 0x10), lr(4), lw(4, 0x10), lw(5, 0), lr(6), lw(6, 3), lr(7), lw(7, 0), lw(8, 0xFF), lr(9), lw(9, 0x10), lr(10), lw(10, 0x10)])
+    log_is(c, [lw(0, 0x80),
+        lw(1, 0x30),
+        lr(2),
+        lw(2, 0),
+        lr(3),
+        lw(3, 0x10),
+        lr(4),
+        lw(4, 0x10),
+        lw(5, 0),
+        lr(6),
+        lw(6, 3),
+        lr(7),
+        lw(7, 0),
+        lw(8, 0xFF),
+        lr(9),
+        lw(9, 0x10),
+        lr(10),
+        lw(10, 0x10)])
     test.assert_eq(at(l.st, 0), 1)
     test.assert_eq(at(l.st, 1), 48000)
     test.assert_eq(at(l.st, 2), 32)
@@ -566,7 +597,24 @@ fn test_8_khz_16_bit_from_12_288_mhz_left_justified() [io, hw]
     let l = link()
     let f = fmt_of(8000, 16, 2, AudioFraming.AudioLeftJustified, false)
     test.assert(es8311.format_set(dut(c), l, cfg_ratio(1536), f))
-    log_is(c, [lw(0, 0x80), lw(1, 0x30), lr(2), lw(2, 0xA0), lr(3), lw(3, 0x10), lr(4), lw(4, 0x20), lw(5, 0), lr(6), lw(6, 3), lr(7), lw(7, 0), lw(8, 0xFF), lr(9), lw(9, 0x0D), lr(10), lw(10, 0x0D)])
+    log_is(c, [lw(0, 0x80),
+        lw(1, 0x30),
+        lr(2),
+        lw(2, 0xA0),
+        lr(3),
+        lw(3, 0x10),
+        lr(4),
+        lw(4, 0x20),
+        lw(5, 0),
+        lr(6),
+        lw(6, 3),
+        lr(7),
+        lw(7, 0),
+        lw(8, 0xFF),
+        lr(9),
+        lw(9, 0x0D),
+        lr(10),
+        lw(10, 0x0D)])
     test.assert_eq(at(l.st, 5), 1)
 
 @test
@@ -594,7 +642,24 @@ fn test_a_master_codec_sets_the_master_bit_and_the_bit_clock_divider() [io, hw]
     let l = link()
     let f = fmt_of(16000, 16, 2, AudioFraming.AudioPhilips, true)
     test.assert(es8311.format_set(dut(c), l, es8311.config_default(), f))
-    log_is(c, [lw(0, 0xC0), lw(1, 0x30), lr(2), lw(2, 0), lr(3), lw(3, 0x10), lr(4), lw(4, 0x20), lw(5, 0), lr(6), lw(6, 7), lr(7), lw(7, 0), lw(8, 0xFF), lr(9), lw(9, 0x0C), lr(10), lw(10, 0x0C)])
+    log_is(c, [lw(0, 0xC0),
+        lw(1, 0x30),
+        lr(2),
+        lw(2, 0),
+        lr(3),
+        lw(3, 0x10),
+        lr(4),
+        lw(4, 0x20),
+        lw(5, 0),
+        lr(6),
+        lw(6, 7),
+        lr(7),
+        lw(7, 0),
+        lw(8, 0xFF),
+        lr(9),
+        lw(9, 0x0C),
+        lr(10),
+        lw(10, 0x0C)])
     test.assert_eq(at(l.st, 4), 1)
 
 @test
@@ -723,7 +788,23 @@ fn test_power_up_mutes_the_dac_before_it_powers_it() [io, hw]
     c.regs.insert(10, 0x40)
     let l = link()
     test.assert(es8311.power_set(dut(c), l, es8311.config_default(), true))
-    log_is(c, [lr(0), lw(0, 0x80), lr(1), lw(1, 0x3F), lr(9), lw(9, 0), lr(10), lw(10, 0), lw(0x31, 0x60), lw(0x17, 0xBF), lw(0x0E, 2), lw(0x12, 0), lw(0x14, 0x1A), lw(0x0D, 1), lw(0x15, 0x40), lw(0x37, 8), lw(0x45, 0)])
+    log_is(c, [lr(0),
+        lw(0, 0x80),
+        lr(1),
+        lw(1, 0x3F),
+        lr(9),
+        lw(9, 0),
+        lr(10),
+        lw(10, 0),
+        lw(0x31, 0x60),
+        lw(0x17, 0xBF),
+        lw(0x0E, 2),
+        lw(0x12, 0),
+        lw(0x14, 0x1A),
+        lw(0x0D, 1),
+        lw(0x15, 0x40),
+        lw(0x37, 8),
+        lw(0x45, 0)])
     test.assert_eq(at(l.st, 10), 0)
 
 @test
@@ -748,7 +829,22 @@ fn test_power_down_follows_the_suspend_sequence_and_stops_the_handle() [io, hw]
     let c = chip()
     let l = link()
     test.assert(es8311.power_set(dut(c), l, es8311.config_default(), false))
-    log_is(c, [lw(0x31, 0x60), lw(0x32, 0), lw(0x17, 0), lw(0x0E, 0xFF), lw(0x12, 2), lw(0x14, 0), lw(0x0D, 0xFA), lw(0x15, 0), lw(2, 0x10), lw(0, 0), lw(0, 0x1F), lw(1, 0x30), lw(1, 0), lw(0x45, 0), lw(0x0D, 0xFC), lw(2, 0)])
+    log_is(c, [lw(0x31, 0x60),
+        lw(0x32, 0),
+        lw(0x17, 0),
+        lw(0x0E, 0xFF),
+        lw(0x12, 2),
+        lw(0x14, 0),
+        lw(0x0D, 0xFA),
+        lw(0x15, 0),
+        lw(2, 0x10),
+        lw(0, 0),
+        lw(0, 0x1F),
+        lw(1, 0x30),
+        lw(1, 0),
+        lw(0x45, 0),
+        lw(0x0D, 0xFC),
+        lw(2, 0)])
     test.assert_eq(at(l.st, 10), 1)
 
 @test
@@ -965,8 +1061,19 @@ fn test_the_clock_and_port_steps_by_name() [io, hw]
     log_is(c, [lw(0, 0xC0), lw(1, 0x30)])
     match es8311.clock_plan(12288000, 8000, 512000)
         Some(p) => test.assert(es8311.step_clocks(d, es8311.config_default(), p, 7))
-        None => test.assert(false)
-    log_is(c, [lr(2), lw(2, 0xA0), lr(3), lw(3, 0x10), lr(4), lw(4, 0x20), lw(5, 0), lr(6), lw(6, 7), lr(7), lw(7, 0), lw(8, 0xFF)])
+        None    => test.assert(false)
+    log_is(c, [lr(2),
+        lw(2, 0xA0),
+        lr(3),
+        lw(3, 0x10),
+        lr(4),
+        lw(4, 0x20),
+        lw(5, 0),
+        lr(6),
+        lw(6, 7),
+        lr(7),
+        lw(7, 0),
+        lw(8, 0xFF)])
     test.assert(es8311.step_serial_port(d, 3, 1, true))
     log_is(c, [lr(9), lw(9, 0x2D), lr(10), lw(10, 0x2D)])
 

@@ -22,6 +22,20 @@ registers. The registers, the clock coefficients and the power sequences
 come from the drivers listed under Tests, and the places where those drivers
 disagree are named in `src/es8311.nv` and below.
 
+## Install
+
+```sh
+novo pkg add es8311-nv
+```
+
+The device program is `examples/tone.nv`.  Make it the `main` of a package that
+depends on this one and build it for a board:
+
+```sh
+novo build --target=nrf52840-dk src/main.nv
+novo build --target=nrf54lm20-dk src/main.nv
+```
+
 ## The device program
 
 `examples/tone.nv` brings the codec up and plays a square wave of about 444

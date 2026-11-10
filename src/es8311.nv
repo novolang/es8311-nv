@@ -84,39 +84,39 @@ use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
 use dev_id.{ DeviceId, Identifiable }
 
 // The registers.
-let RESET     = 0x00
-let CLKMGR1   = 0x01
-let CLKMGR2   = 0x02
-let CLKMGR3   = 0x03
-let CLKMGR4   = 0x04
-let CLKMGR5   = 0x05
-let CLKMGR6   = 0x06
-let CLKMGR7   = 0x07
-let CLKMGR8   = 0x08
-let SDP_IN    = 0x09
-let SDP_OUT   = 0x0A
-let SYS1      = 0x0B
-let SYS2      = 0x0C
-let SYS3      = 0x0D
-let SYS4      = 0x0E
-let SYS6      = 0x10
-let SYS7      = 0x11
-let SYS8      = 0x12
-let SYS9      = 0x13
-let SYS10     = 0x14
-let ADC1      = 0x15
-let ADC2      = 0x16
-let ADC3      = 0x17
-let ADC7      = 0x1B
-let ADC8      = 0x1C
-let DAC1      = 0x31
-let DAC2      = 0x32
-let DAC6      = 0x37
-let GPIO_REG  = 0x44
-let GP_REG    = 0x45
-let CHIP_ID1  = 0xFD
-let CHIP_ID2  = 0xFE
-let CHIP_VER  = 0xFF
+let RESET    = 0x00
+let CLKMGR1  = 0x01
+let CLKMGR2  = 0x02
+let CLKMGR3  = 0x03
+let CLKMGR4  = 0x04
+let CLKMGR5  = 0x05
+let CLKMGR6  = 0x06
+let CLKMGR7  = 0x07
+let CLKMGR8  = 0x08
+let SDP_IN   = 0x09
+let SDP_OUT  = 0x0A
+let SYS1     = 0x0B
+let SYS2     = 0x0C
+let SYS3     = 0x0D
+let SYS4     = 0x0E
+let SYS6     = 0x10
+let SYS7     = 0x11
+let SYS8     = 0x12
+let SYS9     = 0x13
+let SYS10    = 0x14
+let ADC1     = 0x15
+let ADC2     = 0x16
+let ADC3     = 0x17
+let ADC7     = 0x1B
+let ADC8     = 0x1C
+let DAC1     = 0x31
+let DAC2     = 0x32
+let DAC6     = 0x37
+let GPIO_REG = 0x44
+let GP_REG   = 0x45
+let CHIP_ID1 = 0xFD
+let CHIP_ID2 = 0xFE
+let CHIP_VER = 0xFF
 
 // The chip ID bytes.
 let ID1_VALUE = 0x83
@@ -134,9 +134,9 @@ let CLK_BASE      = 0x30
 let CLK_CONVERTER = 0x0F
 
 // SDP_IN and SDP_OUT: the mute bit, LRP, and the fields.
-let SDP_MUTE   = 0x40
-let SDP_LRP    = 0x20
-let SDP_DAC_R  = 0x80
+let SDP_MUTE  = 0x40
+let SDP_LRP   = 0x20
+let SDP_DAC_R = 0x80
 
 // DAC1: both mute bits.
 let DAC_MUTE_BITS = 0x60
@@ -156,9 +156,9 @@ let RESET_HOLD_MS = 20
 // digital volumes run from -95.5 dB at code 0 to +32 dB at code 255 in
 // 0.5 dB steps (esp_codec_dev's range, Linux's TLV).  The input PGA is
 // 0 to 30 dB in 3 dB steps, the ADC scale 0 to 42 dB in 6 dB steps.
-let VOL_MIN_MDB  = -95500
-let VOL_MAX_MDB  = 32000
-let VOL_STEP_MDB = 500
+let VOL_MIN_MDB    = -95500
+let VOL_MAX_MDB    = 32000
+let VOL_STEP_MDB   = 500
 let PGA_STEP_MDB   = 3000
 let PGA_MAX_CODE   = 10
 let SCALE_STEP_MDB = 6000
@@ -540,7 +540,7 @@ pub fn input_mdb(s: InputGain) -> Int
 pub fn gain_set<P: Es8311Port>(p: P, path: CodecPath, g: MilliDb) -> ?MilliDb [hw]
     match path
         CodecPath.CodecOutput => output_gain_set(p, g)
-        CodecPath.CodecInput => input_gain_set(p, g)
+        CodecPath.CodecInput  => input_gain_set(p, g)
 
 fn output_gain_set<P: Es8311Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
     let Some(code) = volume_code(g) else return None
@@ -563,7 +563,7 @@ fn input_gain_set<P: Es8311Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
 pub fn gain_get<P: Es8311Port>(p: P, path: CodecPath) -> ?MilliDb [hw]
     match path
         CodecPath.CodecOutput => output_gain_get(p)
-        CodecPath.CodecInput => input_gain_get(p)
+        CodecPath.CodecInput  => input_gain_get(p)
 
 fn output_gain_get<P: Es8311Port>(p: P) -> ?MilliDb [hw]
     let Some(v) = reg_read(p, DAC2) else return None
