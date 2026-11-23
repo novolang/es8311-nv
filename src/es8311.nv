@@ -331,11 +331,14 @@ pub fn wl_code(depth: Int) -> Int
         return 4
     -1
 
-// The format code of a framing: 0 for I2S, 1 for left-justified.
+// The format code of a framing: 0 for I2S, 1 for left-justified, and -1
+// for a framing the codec's format register has no code for.  DSP mode is
+// `dsp_format_set`'s.
 pub fn fmt_code(f: AudioFraming) -> Int
     match f
         AudioFraming.AudioPhilips       => 0
         AudioFraming.AudioLeftJustified => 1
+        _                               => -1
 
 // ── The named steps ──────────────────────────────────────────────────
 //
@@ -445,14 +448,15 @@ pub fn i2s_config_of(f: AudioFormat) -> I2sConfig
     if f.framing == AudioFraming.AudioLeftJustified
         layout = I2sFormat.I2sLeftJustified
     I2sConfig { sample_rate: f.sample_rate, bit_depth: f.bit_depth, channels: f.channels,
-                role: role, format: layout }
+                role: role, format: layout, slot_bits: f.slot_bits }
 
 // The plan for a format, or `None` when the codec cannot make it: a depth
-// other than 16, 24 or 32, a rate or clock `clock_plan` refuses, or, with
+// other than 16, 24 or 32, a framing `fmt_code` has no code for, a rate or
+// clock `clock_plan` refuses, or, with
 // the codec as master, a bit clock that is not a whole division of the
 // digital clock.
 pub fn plan_of(c: Es8311Config, f: AudioFormat) -> ?ClockPlan
-    if not dev_audio.audio_format_valid(f) or wl_code(f.bit_depth) < 0
+    if not dev_audio.audio_format_valid(f) or wl_code(f.bit_depth) < 0 or fmt_code(f.framing) < 0
         return None
     let bclk = embedded_hal.i2s_bclk_hz(i2s_config_of(f))
     let found = clock_plan(mclk_of(c, f.sample_rate, bclk), f.sample_rate, bclk)
@@ -535,12 +539,14 @@ pub fn input_mdb(s: InputGain) -> Int
 
 // Sets the DAC volume or the input gain to the largest step at or below
 // `g`: the gain set, or `None` when `g` is below the path's range or the
-// part did not take it.  Code 0 of the DAC is -95.5 dB, not silence; the
-// output is silenced by `mute_set`.
+// part did not take it, and `None` for a path the part does not have: it has
+// the output as a whole and the input as a whole.  Code 0 of the DAC is
+// -95.5 dB, not silence; the output is silenced by `mute_set`.
 pub fn gain_set<P: Es8311Port>(p: P, path: CodecPath, g: MilliDb) -> ?MilliDb [hw]
     match path
         CodecPath.CodecOutput => output_gain_set(p, g)
         CodecPath.CodecInput  => input_gain_set(p, g)
+        _                     => None
 
 fn output_gain_set<P: Es8311Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
     let Some(code) = volume_code(g) else return None
@@ -559,11 +565,13 @@ fn input_gain_set<P: Es8311Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
     Some(MilliDb { mdb: input_mdb(s) })
 
 // The gain of a path as the part holds it, or `None` when it did not
-// answer.  An input PGA code above 10 is read as 10.
+// answer or the path is not the output or the input.  An input PGA code
+// above 10 is read as 10.
 pub fn gain_get<P: Es8311Port>(p: P, path: CodecPath) -> ?MilliDb [hw]
     match path
         CodecPath.CodecOutput => output_gain_get(p)
         CodecPath.CodecInput  => input_gain_get(p)
+        _                     => None
 
 fn output_gain_get<P: Es8311Port>(p: P) -> ?MilliDb [hw]
     let Some(v) = reg_read(p, DAC2) else return None

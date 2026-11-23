@@ -1,6 +1,6 @@
 [package]
 name        = "es8311-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "A driver for Everest Semiconductor's ES8311 mono audio codec on an I2C control bus and a board's I2S handle: the chip ID, the clock manager with its divider and multiplier plan for 8 to 96 kHz from MCLK or SCLK, the serial port in I2S, left-justified and DSP formats, the DAC and ADC paths with volume, mute and the microphone gain, and the named power-up and power-down steps, as devices-nv's AudioCodec and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -27,7 +27,7 @@ tier = "embedded"
 [dependencies]
 # The board's I2C handle, the I2cBus, Timer and I2s traits and the I2S
 # settings.
-embedded-hal-nv = "^0.3.3"
+embedded-hal-nv = "^0.4.0"
 # The wiring record, the register helpers, and the AudioCodec and
 # Identifiable traits.
-devices-nv      = "^0.3.3"
+devices-nv      = "^0.4.0"

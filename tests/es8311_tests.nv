@@ -186,7 +186,7 @@ impl I2s for Link
 
 fn fmt_of(rate: Int, depth: Int, ch: Int, framing: AudioFraming, master: Bool) -> AudioFormat
     AudioFormat { sample_rate: rate, bit_depth: depth, channels: ch, framing: framing,
-                  codec_is_master: master }
+                  codec_is_master: master, slot_bits: 0 }
 
 fn cfg_ratio(r: Int) -> Es8311Config
     Es8311Config { mclk_ratio: r, invert_mclk: false, invert_sclk: false, digital_mic: false }
@@ -369,6 +369,11 @@ fn test_the_word_length_and_format_codes() [io]
     test.assert_eq(es8311.wl_code(8), -1)
     test.assert_eq(es8311.fmt_code(AudioFraming.AudioPhilips), 0)
     test.assert_eq(es8311.fmt_code(AudioFraming.AudioLeftJustified), 1)
+    // The framings the format register has no code for.
+    test.assert_eq(es8311.fmt_code(AudioFraming.AudioRightJustified), -1)
+    test.assert_eq(es8311.fmt_code(AudioFraming.AudioDspA), -1)
+    test.assert_eq(es8311.fmt_code(AudioFraming.AudioDspB), -1)
+    test.assert_eq(es8311.fmt_code(AudioFraming.AudioPdm), -1)
 
 @test
 fn test_the_master_clock_follows_the_ratio_or_the_bit_clock() [io]
@@ -401,6 +406,7 @@ fn test_the_plan_for_a_format() [io]
     test.assert(es8311.plan_of(c, fmt_of(0, 16, 2, AudioFraming.AudioPhilips, false)) == None)
     test.assert(es8311.plan_of(c, fmt_of(48000, 16, 3, AudioFraming.AudioPhilips, false)) == None)
     test.assert(es8311.plan_of(c, fmt_of(7000, 16, 2, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(es8311.plan_of(c, fmt_of(48000, 16, 2, AudioFraming.AudioDspA, false)) == None)
 
 // With no master clock the bit clock is the clock: 16-bit stereo is 32 fs,
 // multiplied by 8; 32-bit stereo is 64 fs, by 4; 24-bit, 48 fs, and 16-bit
@@ -430,6 +436,12 @@ fn test_the_i2s_settings_for_a_format() [io]
     let b = es8311.i2s_config_of(fmt_of(44100, 16, 1, AudioFraming.AudioLeftJustified, true))
     test.assert(b.role == I2sRole.I2sSlave)
     test.assert(b.format == I2sFormat.I2sLeftJustified)
+    // The slot is the format's.
+    test.assert_eq(a.slot_bits, 0)
+    let wide = AudioFormat { sample_rate: 44100, bit_depth: 16, channels: 2,
+                             framing: AudioFraming.AudioPhilips, codec_is_master: false,
+                             slot_bits: 32 }
+    test.assert_eq(es8311.i2s_config_of(wide).slot_bits, 32)
 
 // ── The steps ────────────────────────────────────────────────────────
 
@@ -929,6 +941,9 @@ fn test_the_output_gain_reads_back_in_millidecibels() [io, hw]
     test.assert(es8311.gain_get(d, CodecPath.CodecOutput) == Some(MilliDb { mdb: 32000 }))
     c.st.insert(5, 0x32 + 1)
     test.assert(es8311.gain_get(d, CodecPath.CodecOutput) == None)
+    // The paths the part does not have answer `None`, whether it answers or not.
+    test.assert(es8311.gain_get(d, CodecPath.CodecHeadphone) == None)
+    test.assert(es8311.gain_set(d, CodecPath.CodecSpeaker, MilliDb { mdb: 0 }) == None)
 
 fn in_gain(c: Chip, mdb: Int) -> ?MilliDb
     es8311.gain_set(dut(c), CodecPath.CodecInput, MilliDb { mdb: mdb })
