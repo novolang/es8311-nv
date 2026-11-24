@@ -181,7 +181,7 @@ times, and neither can be multiplied to 256.
 
 | Module | What is in it |
 |---|---|
-| `es8311` | `Es8311Config`, `Es8311Port`, the I2C framing, the register access, the clock plan, the named steps, the gain functions, the type `Es8311` and its traits |
+| `es8311` | `Es8311Config`, `Es8311Port` over devices-nv's `RegPort`, the I2C framing, the clock plan, the named steps, the gain functions, the type `Es8311` and its traits |
 
 ## How to choose an entry point
 
@@ -205,7 +205,9 @@ traits on the result.
 | `reg(r)`, `set_reg(r, v)`, `i2s_stop()` | one register, a write, and the handle's clocks stopped |
 
 The steps are functions over `Es8311Port`, a trait a type holding an I2C bus
-implements, so a test runs them over a double of the part: `step_reset`,
+implements with devices-nv's `RegPort` (`read_regs` and `write_reg`; the
+register reads and writes are `port.read_reg(reg)`, `port.write_reg(reg, v)` and
+`port.update_reg(reg, mask, bits)`), so a test runs them over a double of the part: `step_reset`,
 `step_open`, `step_source`, `step_clocks`, `step_serial_port`,
 `step_power_up` and `step_power_down`. Their order is the one place to read
 the sequences:

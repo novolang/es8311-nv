@@ -79,7 +79,7 @@
 //     during the first I2C write"; `reg44_write` retries it once.
 
 use embedded_hal.{ BoardI2c, BoardTimer, I2cBus, Timer, I2s, I2sConfig, I2sRole, I2sFormat }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
 use dev_id.{ DeviceId, Identifiable }
 
@@ -193,13 +193,12 @@ pub fn config_default() -> Es8311Config
 pub fn config_sclk() -> Es8311Config
     Es8311Config { mclk_ratio: 0, invert_mclk: false, invert_sclk: false, digital_mic: false }
 
-// The control port: the I2C bus the codec is on.  `setup` makes the bus
-// ready and answers whether the wiring suits it, `read_regs` reads `n`
-// registers from `reg`, `write_reg` writes one, and `pause_ms` waits.
-pub trait Es8311Port
+// The control port: the I2C bus the codec is on.  `RegPort` is the
+// register access, `read_regs` and `write_reg`, with the register reads
+// and writes built on them; `setup` makes the bus ready and answers
+// whether the wiring suits it, and `pause_ms` waits.
+pub trait Es8311Port: RegPort
     fn setup(self) -> Bool [hw]
-    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
-    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
     fn pause_ms(self, ms: Int) [hw]
 
 // ── The bus ──────────────────────────────────────────────────────────
@@ -226,23 +225,22 @@ pub fn i2c_setup<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
 // ── Registers ────────────────────────────────────────────────────────
 
 // One register, or `None` when the part did not answer.
-pub fn reg_read<P: Es8311Port>(p: P, reg: Int) -> ?Int [hw]
-    var b: DevBytes = Vec.new()
-    if not p.read_regs(reg, 1, var b)
-        return None
-    Some(b[0] as Int)
+pub @deprecated(since = "0.2.0", replace_with = "RegPort.read_reg")
+fn reg_read<P: Es8311Port>(p: P, reg: Int) -> ?Int [hw]
+    p.read_reg(reg)
 
 // Writes `v` to the register `reg`: whether the part acknowledged.  The
 // registers are not read back: RESET and the mute bits change what they
 // hold.
-pub fn reg_write<P: Es8311Port>(p: P, reg: Int, v: Int) -> Bool [hw]
-    p.write_reg(reg, v & 0xFF)
+pub @deprecated(since = "0.2.0", replace_with = "RegPort.write_reg")
+fn reg_write<P: Es8311Port>(p: P, reg: Int, v: Int) -> Bool [hw]
+    p.write_reg(reg, v)
 
 // Sets the bits of `mask` in `reg` to the bits of `bits`, leaving the
 // others, read from the part: whether the part took it.
-pub fn reg_update<P: Es8311Port>(p: P, reg: Int, mask: Int, flags: Int) -> Bool [hw]
-    let Some(old) = reg_read(p, reg) else return false
-    reg_write(p, reg, (old & (0xFF ^ mask)) | (flags & mask))
+pub @deprecated(since = "0.2.0", replace_with = "RegPort.update_reg")
+fn reg_update<P: Es8311Port>(p: P, reg: Int, mask: Int, flags: Int) -> Bool [hw]
+    p.update_reg(reg, mask, flags)
 
 // ── Identity ─────────────────────────────────────────────────────────
 
@@ -250,11 +248,11 @@ pub fn reg_update<P: Es8311Port>(p: P, reg: Int, mask: Int, flags: Int) -> Bool 
 // `rev` the version register.  `None` when no part answers or the ID is
 // not an ES8311's.
 pub fn id_read<P: Es8311Port>(p: P) -> ?DeviceId [hw]
-    let Some(a) = reg_read(p, CHIP_ID1) else return None
-    let Some(b) = reg_read(p, CHIP_ID2) else return None
+    let Some(a) = p.read_reg(CHIP_ID1) else return None
+    let Some(b) = p.read_reg(CHIP_ID2) else return None
     if a != ID1_VALUE or b != ID2_VALUE
         return None
-    let ver = reg_read(p, CHIP_VER)
+    let ver = p.read_reg(CHIP_VER)
     Some(DeviceId { who: (a << 8) | b, rev: ver })
 
 // ── The clock ────────────────────────────────────────────────────────
@@ -348,16 +346,16 @@ pub fn fmt_code(f: AudioFraming) -> Int
 // The first write after the reset is retried once; esp_codec_dev notes the
 // part sometimes drops it.
 fn reg44_write<P: Es8311Port>(p: P, v: Int) -> Bool [hw]
-    reg_write(p, GPIO_REG, v) or reg_write(p, GPIO_REG, v)
+    p.write_reg(GPIO_REG, v) or p.write_reg(GPIO_REG, v)
 
 // Step: the reset.  RESET 0x1F holds the state machine and the blocks in
 // reset, the part waits 20 ms, RESET 0 releases them and 0x80 turns the
 // state machine on.
 pub fn step_reset<P: Es8311Port>(p: P) -> Bool [hw]
-    if not reg_write(p, RESET, RESET_ALL)
+    if not p.write_reg(RESET, RESET_ALL)
         return false
     p.pause_ms(RESET_HOLD_MS)
-    reg_write(p, RESET, 0) and reg_write(p, RESET, RESET_CSM_ON)
+    p.write_reg(RESET, 0) and p.write_reg(RESET, RESET_CSM_ON)
 
 // Step: the base state after the reset, from esp_codec_dev's `open`:
 // analogue power down, noise immunity on, the master clock and bit clock
@@ -365,12 +363,12 @@ pub fn step_reset<P: Es8311Port>(p: P) -> Bool [hw]
 // minimum power, the headphone driver enabled, the ADC filters set and the
 // ADC to DAC test path off.
 pub fn step_open<P: Es8311Port>(p: P, c: Es8311Config) -> Bool [hw]
-    let Some(s3) = reg_read(p, SYS3) else return false
-    if s3 != SYS3_DOWN and not reg_write(p, SYS3, SYS3_DOWN)
+    let Some(s3) = p.read_reg(SYS3) else return false
+    if s3 != SYS3_DOWN and not p.write_reg(SYS3, SYS3_DOWN)
         return false
     if not reg44_write(p, 0x08)
         return false
-    reg_write(p, CLKMGR1, clock_source_bits(c) | CLK_BASE) and reg_write(p, CLKMGR2, 0x00) and reg_write(p, CLKMGR3, 0x10) and reg_write(p, ADC2, 0x24) and reg_write(p, CLKMGR4, 0x10) and reg_write(p, CLKMGR5, 0x00) and reg_write(p, SYS1, 0x00) and reg_write(p, SYS2, 0x00) and reg_write(p, SYS6, 0x1F) and reg_write(p, SYS7, 0x7F) and reg_write(p, SYS9, 0x10) and reg_write(p, ADC7, 0x0A) and reg_write(p, ADC8, 0x6A) and reg_write(p, GPIO_REG, 0x08)
+    p.write_reg(CLKMGR1, clock_source_bits(c) | CLK_BASE) and p.write_reg(CLKMGR2, 0x00) and p.write_reg(CLKMGR3, 0x10) and p.write_reg(ADC2, 0x24) and p.write_reg(CLKMGR4, 0x10) and p.write_reg(CLKMGR5, 0x00) and p.write_reg(SYS1, 0x00) and p.write_reg(SYS2, 0x00) and p.write_reg(SYS6, 0x1F) and p.write_reg(SYS7, 0x7F) and p.write_reg(SYS9, 0x10) and p.write_reg(ADC7, 0x0A) and p.write_reg(ADC8, 0x6A) and p.write_reg(GPIO_REG, 0x08)
 
 // CLKMGR1's source and inversion bits for a configuration.
 pub fn clock_source_bits(c: Es8311Config) -> Int
@@ -388,7 +386,7 @@ pub fn step_clocks<P: Es8311Port>(p: P, c: Es8311Config, plan: ClockPlan, bclk: 
     var sclk = 0
     if c.invert_sclk
         sclk = 0x20
-    reg_update(p, CLKMGR2, 0xF8, ((plan.pre_div - 1) << 5) | (plan.mult_code << 3)) and reg_update(p, CLKMGR3, 0x7F, plan.adc_osr) and reg_update(p, CLKMGR4, 0x7F, plan.dac_osr) and reg_write(p, CLKMGR5, 0x00) and reg_update(p, CLKMGR6, 0x3F, sclk | bclk) and reg_update(p, CLKMGR7, 0x0F, 0x00) and reg_write(p, CLKMGR8, 0xFF)
+    p.update_reg(CLKMGR2, 0xF8, ((plan.pre_div - 1) << 5) | (plan.mult_code << 3)) and p.update_reg(CLKMGR3, 0x7F, plan.adc_osr) and p.update_reg(CLKMGR4, 0x7F, plan.dac_osr) and p.write_reg(CLKMGR5, 0x00) and p.update_reg(CLKMGR6, 0x3F, sclk | bclk) and p.update_reg(CLKMGR7, 0x0F, 0x00) and p.write_reg(CLKMGR8, 0xFF)
 
 // Step: the serial port, both directions: the word length, the format and
 // LRP, leaving the mute bits and the DAC's slot select.  `lrp` is set for
@@ -397,7 +395,7 @@ pub fn step_serial_port<P: Es8311Port>(p: P, wl: Int, fmt: Int, lrp: Bool) -> Bo
     var flags = (wl << 2) | fmt
     if lrp
         flags = flags | SDP_LRP
-    reg_update(p, SDP_IN, 0x3F, flags) and reg_update(p, SDP_OUT, 0x3F, flags)
+    p.update_reg(SDP_IN, 0x3F, flags) and p.update_reg(SDP_OUT, 0x3F, flags)
 
 // Step: the clock source and the role: RESET's master bit, then CLKMGR1
 // with the source and inversion and the master and bit clocks on.
@@ -405,7 +403,7 @@ pub fn step_source<P: Es8311Port>(p: P, c: Es8311Config, master: Bool) -> Bool [
     var v = RESET_CSM_ON
     if master
         v = v | RESET_MASTER
-    reg_write(p, RESET, v) and reg_write(p, CLKMGR1, clock_source_bits(c) | CLK_BASE)
+    p.write_reg(RESET, v) and p.write_reg(CLKMGR1, clock_source_bits(c) | CLK_BASE)
 
 // Step: power up.  The state machine on in the role the part has, the ADC
 // and DAC clocks on, the serial ports unmuted, the DAC muted before it is
@@ -416,7 +414,7 @@ pub fn step_power_up<P: Es8311Port>(p: P, c: Es8311Config) -> Bool [hw]
     var mic = 0x1A
     if c.digital_mic
         mic = mic | 0x40
-    reg_update(p, RESET, RESET_CSM_ON, RESET_CSM_ON) and reg_update(p, CLKMGR1, CLK_CONVERTER, CLK_CONVERTER) and reg_update(p, SDP_IN, SDP_MUTE, 0) and reg_update(p, SDP_OUT, SDP_MUTE, 0) and reg_write(p, DAC1, DAC_MUTE_BITS) and reg_write(p, ADC3, 0xBF) and reg_write(p, SYS4, 0x02) and reg_write(p, SYS8, 0x00) and reg_write(p, SYS10, mic) and reg_write(p, SYS3, SYS3_UP) and reg_write(p, ADC1, 0x40) and reg_write(p, DAC6, 0x08) and reg_write(p, GP_REG, 0x00)
+    p.update_reg(RESET, RESET_CSM_ON, RESET_CSM_ON) and p.update_reg(CLKMGR1, CLK_CONVERTER, CLK_CONVERTER) and p.update_reg(SDP_IN, SDP_MUTE, 0) and p.update_reg(SDP_OUT, SDP_MUTE, 0) and p.write_reg(DAC1, DAC_MUTE_BITS) and p.write_reg(ADC3, 0xBF) and p.write_reg(SYS4, 0x02) and p.write_reg(SYS8, 0x00) and p.write_reg(SYS10, mic) and p.write_reg(SYS3, SYS3_UP) and p.write_reg(ADC1, 0x40) and p.write_reg(DAC6, 0x08) and p.write_reg(GP_REG, 0x00)
 
 // Step: power down, from esp_codec_dev's suspend.  The DAC is muted first,
 // then the volumes go to their lowest, the PGA, modulator and DAC are
@@ -424,7 +422,7 @@ pub fn step_power_up<P: Es8311Port>(p: P, c: Es8311Config) -> Bool [hw]
 // machine is held in reset and the clocks are stopped.  The clock
 // registers are lost, so a power-up needs `codec_set_format` again.
 pub fn step_power_down<P: Es8311Port>(p: P) -> Bool [hw]
-    reg_write(p, DAC1, DAC_MUTE_BITS) and reg_write(p, DAC2, 0x00) and reg_write(p, ADC3, 0x00) and reg_write(p, SYS4, 0xFF) and reg_write(p, SYS8, 0x02) and reg_write(p, SYS10, 0x00) and reg_write(p, SYS3, SYS3_DOWN) and reg_write(p, ADC1, 0x00) and reg_write(p, CLKMGR2, 0x10) and reg_write(p, RESET, 0x00) and reg_write(p, RESET, RESET_ALL) and reg_write(p, CLKMGR1, 0x30) and reg_write(p, CLKMGR1, 0x00) and reg_write(p, GP_REG, 0x00) and reg_write(p, SYS3, SYS3_SUSPEND) and reg_write(p, CLKMGR2, 0x00)
+    p.write_reg(DAC1, DAC_MUTE_BITS) and p.write_reg(DAC2, 0x00) and p.write_reg(ADC3, 0x00) and p.write_reg(SYS4, 0xFF) and p.write_reg(SYS8, 0x02) and p.write_reg(SYS10, 0x00) and p.write_reg(SYS3, SYS3_DOWN) and p.write_reg(ADC1, 0x00) and p.write_reg(CLKMGR2, 0x10) and p.write_reg(RESET, 0x00) and p.write_reg(RESET, RESET_ALL) and p.write_reg(CLKMGR1, 0x30) and p.write_reg(CLKMGR1, 0x00) and p.write_reg(GP_REG, 0x00) and p.write_reg(SYS3, SYS3_SUSPEND) and p.write_reg(CLKMGR2, 0x00)
 
 // Brings the part up: the bus ready, the chip ID read, the reset and the
 // base state.  Answers whether the part answered as an ES8311 and took every
@@ -496,12 +494,12 @@ pub fn mute_set<P: Es8311Port>(p: P, on: Bool) -> Bool [hw]
     var flags = 0
     if on
         flags = DAC_MUTE_BITS
-    reg_update(p, DAC1, DAC_MUTE_BITS, flags)
+    p.update_reg(DAC1, DAC_MUTE_BITS, flags)
 
 // Whether the DAC is muted: both bits set; `None` when the part did not
 // answer.
 pub fn mute_get<P: Es8311Port>(p: P) -> ?Bool [hw]
-    let Some(v) = reg_read(p, DAC1) else return None
+    let Some(v) = p.read_reg(DAC1) else return None
     Some((v & DAC_MUTE_BITS) == DAC_MUTE_BITS)
 
 // The DAC volume register for a gain in thousandths of a decibel, or
@@ -550,7 +548,7 @@ pub fn gain_set<P: Es8311Port>(p: P, path: CodecPath, g: MilliDb) -> ?MilliDb [h
 
 fn output_gain_set<P: Es8311Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
     let Some(code) = volume_code(g) else return None
-    if not reg_write(p, DAC2, code)
+    if not p.write_reg(DAC2, code)
         return None
     Some(MilliDb { mdb: volume_mdb(code) })
 
@@ -558,9 +556,9 @@ fn input_gain_set<P: Es8311Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
     if g.mdb < 0
         return None
     let s = input_split(g.mdb)
-    if not reg_update(p, SYS10, 0x0F, s.pga)
+    if not p.update_reg(SYS10, 0x0F, s.pga)
         return None
-    if not reg_update(p, ADC2, 0x07, s.scale)
+    if not p.update_reg(ADC2, 0x07, s.scale)
         return None
     Some(MilliDb { mdb: input_mdb(s) })
 
@@ -574,12 +572,12 @@ pub fn gain_get<P: Es8311Port>(p: P, path: CodecPath) -> ?MilliDb [hw]
         _                     => None
 
 fn output_gain_get<P: Es8311Port>(p: P) -> ?MilliDb [hw]
-    let Some(v) = reg_read(p, DAC2) else return None
+    let Some(v) = p.read_reg(DAC2) else return None
     Some(MilliDb { mdb: volume_mdb(v) })
 
 fn input_gain_get<P: Es8311Port>(p: P) -> ?MilliDb [hw]
-    let Some(a) = reg_read(p, SYS10) else return None
-    let Some(b) = reg_read(p, ADC2) else return None
+    let Some(a) = p.read_reg(SYS10) else return None
+    let Some(b) = p.read_reg(ADC2) else return None
     var pga = a & 0x0F
     if pga > PGA_MAX_CODE
         pga = PGA_MAX_CODE
@@ -592,13 +590,13 @@ fn input_gain_get<P: Es8311Port>(p: P) -> ?MilliDb [hw]
 // `None`.
 pub fn adc_volume_set<P: Es8311Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
     let Some(code) = volume_code(g) else return None
-    if not reg_write(p, ADC3, code)
+    if not p.write_reg(ADC3, code)
         return None
     Some(MilliDb { mdb: volume_mdb(code) })
 
 // The ADC digital volume as the part holds it.
 pub fn adc_volume_get<P: Es8311Port>(p: P) -> ?MilliDb [hw]
-    let Some(v) = reg_read(p, ADC3) else return None
+    let Some(v) = p.read_reg(ADC3) else return None
     Some(MilliDb { mdb: volume_mdb(v) })
 
 // Selects a digital microphone on MIC1P (`true`) or the analogue input,
@@ -607,14 +605,14 @@ pub fn dmic_set<P: Es8311Port>(p: P, on: Bool) -> Bool [hw]
     var flags = 0
     if on
         flags = 0x40
-    reg_update(p, SYS10, 0x40, flags)
+    p.update_reg(SYS10, 0x40, flags)
 
 // Enables the headphone driver (`true`) or leaves the line output.
 pub fn headphone_set<P: Es8311Port>(p: P, on: Bool) -> Bool [hw]
     var flags = 0
     if on
         flags = 0x10
-    reg_update(p, SYS9, 0x10, flags)
+    p.update_reg(SYS9, 0x10, flags)
 
 // Puts both serial ports in DSP/PCM mode, A (`b` false) or B (`b` true,
 // LRP set), at the word length of `depth`; the handle is the caller's to
@@ -631,7 +629,7 @@ pub fn dac_slot_set<P: Es8311Port>(p: P, right: Bool) -> Bool [hw]
     var flags = 0
     if right
         flags = SDP_DAC_R
-    reg_update(p, SDP_IN, SDP_DAC_R, flags)
+    p.update_reg(SDP_IN, SDP_DAC_R, flags)
 
 // ── The codec on a board's I2C bus and I2S handle ────────────────────
 
@@ -651,15 +649,16 @@ pub fn attach<S: I2s>(bus: BoardI2c, w: DeviceWiring, i2s: S, cfg: Es8311Config)
     system
         return Es8311 { bus: bus, w: w, i2s: i2s, cfg: cfg }
 
-impl Es8311Port for Es8311
-    fn setup(self) -> Bool [hw]
-        i2c_setup(self.bus, self.w)
-
+impl RegPort for Es8311
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         i2c_read_into(self.bus, self.w, reg, n, var dst)
 
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         i2c_write(self.bus, self.w, reg, v)
+
+impl Es8311Port for Es8311
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.w)
 
     fn pause_ms(self, ms: Int) [hw]
         BoardTimer { id: 0 }.delay_ms(ms)
@@ -672,11 +671,11 @@ impl Es8311
 
     // One register's byte, `None` when the part did not answer.
     fn reg(self, r: Int) -> ?Int [hw]
-        reg_read(self, r)
+        self.read_reg(r)
 
     // Writes a register.
     fn set_reg(self, r: Int, v: Int) -> Bool [hw]
-        reg_write(self, r, v)
+        self.write_reg(r, v)
 
     // The ADC digital volume (`adc_volume_set`).
     fn set_adc_volume(self, g: MilliDb) -> ?MilliDb [hw]

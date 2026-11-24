@@ -21,7 +21,7 @@
 
 use std.test
 use embedded_hal.{ BoardI2c, I2cBus, I2s, I2sConfig, I2sRole, I2sFormat }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
 use dev_id.{ DeviceId, Identifiable }
 use es8311
@@ -121,15 +121,16 @@ struct Dut
     bus: FakeI2c
     w: DeviceWiring
 
-impl Es8311Port for Dut
-    fn setup(self) -> Bool [hw]
-        es8311.i2c_setup(self.bus, self.w)
-
+impl RegPort for Dut
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         es8311.i2c_read_into(self.bus, self.w, reg, n, var dst)
 
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         es8311.i2c_write(self.bus, self.w, reg, v)
+
+impl Es8311Port for Dut
+    fn setup(self) -> Bool [hw]
+        es8311.i2c_setup(self.bus, self.w)
 
     fn pause_ms(self, ms: Int) [hw]
         log_push(self.bus.c, lp(ms))
@@ -206,10 +207,10 @@ fn test_a_read_is_a_write_of_the_register_and_a_repeated_start() [io, hw]
     let c = chip()
     c.regs.insert(0x32, 0x77)
     let d = dut(c)
-    test.assert(es8311.reg_read(d, 0x32) == Some(0x77))
+    test.assert(d.read_reg(0x32) == Some(0x77))
     log_is(c, [lr(0x32)])
     c.st.insert(5, 0x32 + 1)
-    test.assert(es8311.reg_read(d, 0x32) == None)
+    test.assert(d.read_reg(0x32) == None)
 
 @test
 fn test_setup_sets_the_bus_to_400_khz_and_needs_an_address() [io, hw]
@@ -225,8 +226,8 @@ fn test_a_part_that_is_not_there_refuses_every_transaction() [io, hw]
     c.st.insert(0, 0)
     let d = dut(c)
     test.assert(not d.write_reg(0x32, 1))
-    test.assert(es8311.reg_read(d, 0x32) == None)
-    test.assert(not es8311.reg_update(d, 0x32, 0xFF, 1))
+    test.assert(d.read_reg(0x32) == None)
+    test.assert(not d.update_reg(0x32, 0xFF, 1))
     test.assert(es8311.id_read(d) == None)
 
 @test
@@ -234,11 +235,11 @@ fn test_an_update_keeps_the_bits_outside_the_mask() [io, hw]
     let c = chip()
     c.regs.insert(0x14, 0x5A)
     let d = dut(c)
-    test.assert(es8311.reg_update(d, 0x14, 0x0F, 0x03))
+    test.assert(d.update_reg(0x14, 0x0F, 0x03))
     test.assert_eq(reg_of(c, 0x14), 0x53)
     log_is(c, [lr(0x14), lw(0x14, 0x53)])
     c.st.insert(5, 0x14 + 1)
-    test.assert(not es8311.reg_update(d, 0x14, 0x0F, 0x03))
+    test.assert(not d.update_reg(0x14, 0x0F, 0x03))
 
 // ── Identity ─────────────────────────────────────────────────────────
 
@@ -1115,3 +1116,13 @@ fn test_a_register_write_is_eight_bits_and_the_volume_helpers_agree() [io, hw]
     test.assert_eq(es8311.volume_mdb(191), 0)
     test.assert_eq(es8311.volume_mdb(0), -95500)
     test.assert_eq(es8311.volume_mdb(255), 32000)
+
+// ── The functions that the register methods replace ──────────────────
+
+@test
+fn test_the_deprecated_register_functions_answer_as_the_methods_do() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(es8311.reg_read(d, 0x32), d.read_reg(0x32))
+    test.assert_eq(es8311.reg_write(d, 0x32, 0x01), d.write_reg(0x32, 0x01))
+    test.assert_eq(es8311.reg_update(d, 0x32, 0x0F, 0x01), d.update_reg(0x32, 0x0F, 0x01))
