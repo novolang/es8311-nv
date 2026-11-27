@@ -87,7 +87,7 @@ fn main() [hw]
         let set = part.codec_set_gain(CodecPath.CodecOutput, MilliDb { mdb: -6000 })
         if set != None
             // After the first buffer is queued the output is opened.
-            let _ = part.codec_set_mute(false)
+            part.codec_set_mute(false)
 ```
 
 The full program, which also fills and sends the buffers, is

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 — 2026-11-27
+
+The README example calls `part.codec_set_mute` without a binding.  `examples/tone.nv` keeps `let _ =` before the two `push` calls that fill the buffer and says in a comment that the frames fit it.  No signature of the package changed.
+
 ## 0.2.0 — 2026-11-24
 
 The register reads and writes, and the bus set-up, are devices-nv's `RegPort` and `wiring_*` functions, and `Es8311Port` is smaller by them.  The release depends on devices-nv 0.4.1.
